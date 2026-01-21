@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>自定义地图</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f5f7fb;
+      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    #map {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+    .badge {
+      position: absolute;
+      left: 50%;
+      top: 16px;
+      transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.85);
+  color: #1f2a44;
+      padding: 8px 14px;
+      border-radius: 18px;
+      font-size: 13px;
+      letter-spacing: 0.4px;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <div class="badge">自定义地图 · 支持拖动与双指缩放</div>
+
+  <script>
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+    const badge = document.querySelector('.badge');
+
+    const state = {
+      scale: 1,
+      minScale: 0.5,
+      maxScale: 5,
+      offsetX: 0,
+      offsetY: 0,
+      dragging: false,
+      lastX: 0,
+      lastY: 0,
+      pinchStartDist: 0,
+      pinchStartScale: 1
+    };
+
+    const OSM_URLS = [
+      'map.osm',
+      './map.osm',
+      'resource://rawfile/map.osm'
+    ];
+    const renderData = {
+      bounds: null,
+      roads: [],
+      buildings: [],
+      areas: [],
+      waters: [],
+      pitches: [],
+      labels: []
+    };
+    const customMarkers = [];
+    let showAutoLabels = true;
+    let mapWidth = 2000;
+    let mapHeight = 2000;
+    let dataReady = false;
+    let loadError = null;
+
+    function resize() {
+      canvas.width = window.innerWidth * devicePixelRatio;
+      canvas.height = window.innerHeight * devicePixelRatio;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(devicePixelRatio, devicePixelRatio);
+      if (dataReady) {
+        fitToView();
+      }
+      draw();
+    }
+
+    function clampScale(scale) {
+      return Math.min(state.maxScale, Math.max(state.minScale, scale));
+    }
+
+    function zoomAt(clientX, clientY, newScale) {
+      const scale = state.scale;
+      const worldX = (clientX - state.offsetX) / scale;
+      const worldY = (clientY - state.offsetY) / scale;
+      state.scale = clampScale(newScale);
+      state.offsetX = clientX - worldX * state.scale;
+      state.offsetY = clientY - worldY * state.scale;
+    }
+
+    function setBadge(text) {
+      if (badge) {
+        badge.textContent = text;
+      }
+    }
+
+    function parseTags(element) {
+      const tags = {};
+      const tagNodes = element.getElementsByTagName('tag');
+      for (const tag of tagNodes) {
+        const key = tag.getAttribute('k');
+        const value = tag.getAttribute('v');
+        if (key && value) {
+          tags[key] = value;
+        }
+      }
+      return tags;
+    }
+
+    function parseBounds(xmlDoc) {
+      const boundsEl = xmlDoc.querySelector('bounds');
+      if (!boundsEl) {
+        return null;
+      }
+      const minLat = Number(boundsEl.getAttribute('minlat'));
+      const minLon = Number(boundsEl.getAttribute('minlon'));
+      const maxLat = Number(boundsEl.getAttribute('maxlat'));
+      const maxLon = Number(boundsEl.getAttribute('maxlon'));
+      if ([minLat, minLon, maxLat, maxLon].some((value) => Number.isNaN(value))) {
+        return null;
+      }
+      return { minLat, minLon, maxLat, maxLon };
+    }
+
+    function computeMapSize(bounds) {
+      const lonSpan = bounds.maxLon - bounds.minLon;
+      const latSpan = bounds.maxLat - bounds.minLat;
+      mapWidth = 2000;
+      mapHeight = mapWidth * (latSpan / lonSpan);
+    }
+
+    function getCentroid(points) {
+      let sumX = 0;
+      let sumY = 0;
+      for (const point of points) {
+        sumX += point.x;
+        sumY += point.y;
+      }
+      return {
+        x: sumX / points.length,
+        y: sumY / points.length
+      };
+    }
+
+    function project(lat, lon) {
+      const bounds = renderData.bounds;
+      const lonSpan = bounds.maxLon - bounds.minLon;
+      const latSpan = bounds.maxLat - bounds.minLat;
+      const x = ((lon - bounds.minLon) / lonSpan) * mapWidth;
+      const y = ((bounds.maxLat - lat) / latSpan) * mapHeight;
+      return { x, y };
+    }
+
+    function buildRenderData(xmlDoc) {
+      renderData.roads = [];
+      renderData.buildings = [];
+      renderData.areas = [];
+      renderData.waters = [];
+  renderData.pitches = [];
+      renderData.labels = [];
+
+      const nodes = new Map();
+      const nodeElements = xmlDoc.getElementsByTagName('node');
+      for (const node of nodeElements) {
+        const id = node.getAttribute('id');
+        const lat = Number(node.getAttribute('lat'));
+        const lon = Number(node.getAttribute('lon'));
+        if (!id || Number.isNaN(lat) || Number.isNaN(lon)) {
+          continue;
+        }
+        const tags = parseTags(node);
+        nodes.set(id, { lat, lon, tags });
+
+        const name = tags.name;
+        const isLabel = Boolean(name && (tags.amenity || tags.shop || tags.tourism || tags.barrier || tags.man_made || tags.building));
+        if (isLabel) {
+          renderData.labels.push({
+            name,
+            position: project(lat, lon),
+            priority: tags.amenity || tags.shop || tags.tourism ? 3 : 2
+          });
+        }
+      }
+
+      const wayElements = xmlDoc.getElementsByTagName('way');
+      for (const way of wayElements) {
+        const tags = parseTags(way);
+        const nodeRefs = way.getElementsByTagName('nd');
+        const points = [];
+        for (const ref of nodeRefs) {
+          const nodeId = ref.getAttribute('ref');
+          const node = nodeId ? nodes.get(nodeId) : null;
+          if (!node) {
+            continue;
+          }
+          points.push(project(node.lat, node.lon));
+        }
+        if (points.length < 2) {
+          continue;
+        }
+
+        if (tags.building) {
+          renderData.buildings.push({ points, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.leisure === 'pitch' || tags.sport) {
+          renderData.pitches.push({ points, sport: tags.sport || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.highway) {
+          renderData.roads.push({ points, type: tags.highway, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 1
+            });
+          }
+          continue;
+        }
+
+        if (tags.natural === 'water' || tags.landuse === 'reservoir' || tags.waterway) {
+          renderData.waters.push({ points, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.leisure === 'park' || tags.landuse === 'grass' || tags.landuse === 'meadow' || tags.landuse === 'forest') {
+          renderData.areas.push({ points, type: tags.leisure || tags.landuse || '', name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 1
+            });
+          }
+        }
+      }
+    }
+
+    function fitToView() {
+      const viewportWidth = canvas.width / devicePixelRatio;
+      const viewportHeight = canvas.height / devicePixelRatio;
+      const padding = 24;
+      const scaleX = (viewportWidth - padding * 2) / mapWidth;
+      const scaleY = (viewportHeight - padding * 2) / mapHeight;
+      const nextScale = clampScale(Math.min(scaleX, scaleY));
+      state.scale = nextScale;
+      state.minScale = nextScale * 0.6;
+      state.maxScale = nextScale * 6;
+      state.offsetX = (viewportWidth - mapWidth * nextScale) / 2;
+      state.offsetY = (viewportHeight - mapHeight * nextScale) / 2;
+    }
+
+    function drawPath(points, closePath = false) {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      if (closePath) {
+        ctx.closePath();
+      }
+    }
+
+    function drawAreas() {
+      ctx.fillStyle = '#c7efc0';
+      for (const area of renderData.areas) {
+        drawPath(area.points, true);
+        ctx.fill();
+      }
+    }
+
+    function drawWaters() {
+      ctx.fillStyle = '#b7d8ff';
+      for (const water of renderData.waters) {
+        drawPath(water.points, true);
+        ctx.fill();
+      }
+    }
+
+    function drawPitches() {
+      ctx.fillStyle = '#7fd6c2';
+      ctx.strokeStyle = '#f2b184';
+      ctx.lineWidth = 6 / state.scale;
+      for (const pitch of renderData.pitches) {
+        drawPath(pitch.points, true);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2 / state.scale;
+        ctx.stroke();
+
+        ctx.strokeStyle = '#f6d5b2';
+        ctx.lineWidth = 3.5 / state.scale;
+        ctx.stroke();
+      }
+    }
+
+    function drawBuildings() {
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#cbd5e1';
+      ctx.lineWidth = 1 / state.scale;
+      for (const building of renderData.buildings) {
+        drawPath(building.points, true);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    function drawRoads() {
+      const roadStyles = {
+        motorway: { width: 6, color: '#ffd18a', casing: '#e0b064' },
+        trunk: { width: 5.5, color: '#ffe0a6', casing: '#d6b06f' },
+        primary: { width: 5, color: '#ffe8bf', casing: '#d7c19a' },
+        secondary: { width: 4.2, color: '#ffffff', casing: '#cbd5e1' },
+        tertiary: { width: 3.6, color: '#ffffff', casing: '#cbd5e1' },
+        residential: { width: 3, color: '#ffffff', casing: '#d3dbe4' },
+        service: { width: 2.4, color: '#ffffff', casing: '#dbe3ea' },
+        footway: { width: 1.6, color: '#f3f9f0', casing: '#b6d4b0' },
+        path: { width: 1.2, color: '#f3f9f0', casing: '#b6d4b0' }
+      };
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const road of renderData.roads) {
+        const style = roadStyles[road.type] || { width: 2.2, color: '#ffffff', casing: '#d3dbe4' };
+        ctx.strokeStyle = style.casing;
+        ctx.lineWidth = (style.width + 1.6) / state.scale;
+        drawPath(road.points, false);
+        ctx.stroke();
+
+        ctx.strokeStyle = style.color;
+        ctx.lineWidth = style.width / state.scale;
+        drawPath(road.points, false);
+        ctx.stroke();
+      }
+    }
+
+    function drawLabels() {
+      if (!showAutoLabels || state.scale < 0.7) {
+        return;
+      }
+      const fontSize = Math.max(10, 12 / state.scale);
+      ctx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`;
+      ctx.fillStyle = '#1f2a44';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+      ctx.lineWidth = 3 / state.scale;
+      const gridSize = 90 / state.scale;
+      const occupied = new Set();
+      const sortedLabels = [...renderData.labels].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+      for (const label of sortedLabels) {
+        const textX = label.position.x + 6 / state.scale;
+        const textY = label.position.y - 6 / state.scale;
+        const gridX = Math.floor(textX / gridSize);
+        const gridY = Math.floor(textY / gridSize);
+        const key = `${gridX}-${gridY}`;
+        if (occupied.has(key)) {
+          continue;
+        }
+        occupied.add(key);
+        if ((label.priority || 0) >= 3) {
+          const markerX = label.position.x;
+          const markerY = label.position.y;
+          const radius = 5 / state.scale;
+          ctx.fillStyle = '#2f7df6';
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+          ctx.lineWidth = 2 / state.scale;
+          ctx.beginPath();
+          ctx.arc(markerX, markerY, radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = '#1f2a44';
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+          ctx.lineWidth = 3 / state.scale;
+        }
+        ctx.strokeText(label.name, textX, textY);
+        ctx.fillText(label.name, textX, textY);
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.setTransform(state.scale, 0, 0, state.scale, state.offsetX, state.offsetY);
+      ctx.fillStyle = '#dfefff';
+      ctx.fillRect(0, 0, mapWidth, mapHeight);
+      if (dataReady) {
+        drawAreas();
+        drawWaters();
+        drawPitches();
+        drawBuildings();
+        drawRoads();
+        drawLabels();
+        drawCustomMarkers();
+      } else {
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = `bold ${28 / state.scale}px "PingFang SC", "Microsoft YaHei", sans-serif`;
+        const message = loadError ? 'OSM 加载失败' : '正在加载 OSM 数据…';
+        ctx.fillText(message, 40, 80);
+      }
+      ctx.restore();
+    }
+
+    function fetchWithXHR(url) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('GET', url, true);
+        request.onreadystatechange = () => {
+          if (request.readyState !== 4) {
+            return;
+          }
+          if (request.status >= 200 && request.status < 300) {
+            resolve(request.responseText);
+          } else {
+            reject(new Error(`XHR ${request.status}`));
+          }
+        };
+        request.onerror = () => reject(new Error('XHR failed'));
+        request.send(null);
+      });
+    }
+
+    async function fetchText(url) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Fetch ${response.status}`);
+        }
+        return await response.text();
+      } catch (error) {
+        return await fetchWithXHR(url);
+      }
+    }
+
+    function loadOSMFromText(text, sourceLabel) {
+      const xmlDoc = new DOMParser().parseFromString(text, 'text/xml');
+      const bounds = parseBounds(xmlDoc);
+      if (!bounds) {
+        throw new Error('OSM bounds 解析失败');
+      }
+      renderData.bounds = bounds;
+      computeMapSize(bounds);
+      buildRenderData(xmlDoc);
+      dataReady = true;
+      fitToView();
+      setBadge(sourceLabel || '本地 OSM 地图 · 支持双指缩放与拖动');
+    }
+
+    async function loadOSM() {
+      try {
+        setBadge('正在加载 OSM 数据…');
+        let text = '';
+        let lastError = null;
+        for (const url of OSM_URLS) {
+          try {
+            text = await fetchText(url);
+            if (text) {
+              break;
+            }
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (!text) {
+          throw lastError || new Error('OSM 加载失败');
+        }
+        loadOSMFromText(text, '本地 OSM 地图 · 支持双指缩放与拖动');
+      } catch (error) {
+        loadError = error;
+        const message = error && error.message ? error.message : '未知错误';
+        setBadge(`OSM 加载失败 · ${message}`);
+      }
+      draw();
+    }
+
+    window.setOSMText = (text) => {
+      try {
+        if (!text || typeof text !== 'string') {
+          throw new Error('注入数据为空');
+        }
+        loadOSMFromText(text, 'OSM 数据已注入 · 支持双指缩放与拖动');
+        loadError = null;
+      } catch (error) {
+        loadError = error;
+        const message = error && error.message ? error.message : '未知错误';
+        setBadge(`OSM 注入失败 · ${message}`);
+      }
+      draw();
+    };
+
+    function drawCustomMarkers() {
+      if (!customMarkers.length) {
+        return;
+      }
+      ctx.fillStyle = '#2563eb';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.lineWidth = 2 / state.scale;
+      ctx.font = `${Math.max(10, 12 / state.scale)}px "PingFang SC", "Microsoft YaHei", sans-serif`;
+      ctx.fillStyle = '#2563eb';
+      for (const marker of customMarkers) {
+        const point = project(marker.lat, marker.lon);
+        const radius = 6 / state.scale;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        if (marker.label) {
+          const textX = point.x + 10 / state.scale;
+          const textY = point.y - 6 / state.scale;
+          ctx.strokeText(marker.label, textX, textY);
+          ctx.fillText(marker.label, textX, textY);
+        }
+      }
+    }
+
+    window.setCustomMarkers = (markers) => {
+      if (!Array.isArray(markers)) {
+        return;
+      }
+      customMarkers.length = 0;
+      for (const marker of markers) {
+        if (typeof marker?.lat === 'number' && typeof marker?.lon === 'number') {
+          customMarkers.push({
+            lat: marker.lat,
+            lon: marker.lon,
+            label: typeof marker.label === 'string' ? marker.label : ''
+          });
+        }
+      }
+      draw();
+    };
+
+    window.addCustomMarker = (marker) => {
+      if (marker && typeof marker.lat === 'number' && typeof marker.lon === 'number') {
+        customMarkers.push({
+          lat: marker.lat,
+          lon: marker.lon,
+          label: typeof marker.label === 'string' ? marker.label : ''
+        });
+        draw();
+      }
+    };
+
+    window.setAutoLabelsEnabled = (enabled) => {
+      showAutoLabels = Boolean(enabled);
+      draw();
+    };
+
+    function onPointerDown(x, y) {
+      state.dragging = true;
+      state.lastX = x;
+      state.lastY = y;
+    }
+
+    function onPointerMove(x, y) {
+      if (!state.dragging) return;
+      const dx = x - state.lastX;
+      const dy = y - state.lastY;
+      state.offsetX += dx;
+      state.offsetY += dy;
+      state.lastX = x;
+      state.lastY = y;
+      draw();
+    }
+
+    function onPointerUp() {
+      state.dragging = false;
+    }
+
+    canvas.addEventListener('mousedown', (event) => {
+      onPointerDown(event.clientX, event.clientY);
+    });
+
+    canvas.addEventListener('mousemove', (event) => {
+      onPointerMove(event.clientX, event.clientY);
+    });
+
+    window.addEventListener('mouseup', () => {
+      onPointerUp();
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const delta = event.deltaY > 0 ? -0.1 : 0.1;
+      zoomAt(event.clientX, event.clientY, state.scale + delta);
+      draw();
+    }, { passive: false });
+
+    canvas.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 1) {
+        const touch = event.touches[0];
+        onPointerDown(touch.clientX, touch.clientY);
+      } else if (event.touches.length === 2) {
+        const [t1, t2] = event.touches;
+        const dx = t2.clientX - t1.clientX;
+        const dy = t2.clientY - t1.clientY;
+        state.pinchStartDist = Math.hypot(dx, dy);
+        state.pinchStartScale = state.scale;
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (event) => {
+      event.preventDefault();
+      if (event.touches.length === 1) {
+        const touch = event.touches[0];
+        onPointerMove(touch.clientX, touch.clientY);
+      } else if (event.touches.length === 2) {
+        const [t1, t2] = event.touches;
+        const dx = t2.clientX - t1.clientX;
+        const dy = t2.clientY - t1.clientY;
+        const dist = Math.hypot(dx, dy);
+        const midpointX = (t1.clientX + t2.clientX) / 2;
+        const midpointY = (t1.clientY + t2.clientY) / 2;
+        const nextScale = state.pinchStartScale * (dist / state.pinchStartDist);
+        zoomAt(midpointX, midpointY, nextScale);
+        draw();
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', () => {
+      onPointerUp();
+    });
+
+    window.addEventListener('resize', resize);
+
+    resize();
+    loadOSM();
+  </script>
+</body>
+</html>
