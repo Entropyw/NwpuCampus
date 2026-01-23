@@ -31,7 +31,7 @@ struct Index {
   private startIndex: number = 0;
   private endIndex: number = 1;
 
-  private readonly poiList: Array<POI> = [
+  private poiList: Array<POI> = [
     { name: '东门', lat: 34.03204, lon: 108.76465 },
     { name: '西门', lat: 34.02023, lon: 108.75439 },
     { name: '南门', lat: 34.02519, lon: 108.76427 },
@@ -43,14 +43,24 @@ struct Index {
   ];
 
   private async injectOsmToWeb(): Promise<void> {
-    if (this.hasInjectedOsm) {
+    if (this.osmInjected) {
       return;
     }
     try {
-      const context = getContext(this);
-      const buffer = await context.resourceManager.getRawFileContent('map.osm');
-      const decoder = new util.TextDecoder('utf-8');
-      const osmText = decoder.decode(buffer);
+      // read raw file content; resourceManager.getRawFileContent may return ArrayBuffer, Uint8Array or string
+      const buffer: ArrayBuffer | Uint8Array | string = await getContext(this).resourceManager.getRawFileContent('map.osm');
+      let osmText: string = '';
+      if (typeof buffer === 'string') {
+        osmText = buffer;
+      } else if (buffer instanceof ArrayBuffer) {
+        osmText = this.utf8ArrayToStr(new Uint8Array(buffer));
+      } else if (buffer instanceof Uint8Array) {
+        osmText = this.utf8ArrayToStr(buffer as Uint8Array);
+      } else if (Array.isArray(buffer)) {
+        osmText = this.utf8ArrayToStr(new Uint8Array(buffer as number[]));
+      } else {
+        osmText = String(buffer);
+      }
       const script = `window.setOSMText && window.setOSMText(${JSON.stringify(osmText)});`;
       this.webController.runJavaScript(script);
       this.osmInjected = true;
@@ -60,18 +70,50 @@ struct Index {
     }
   }
 
+
+  // UTF-8 decoder for ArrayBuffer/Uint8Array -> string (avoids depending on TextDecoder/util)
+  private utf8ArrayToStr(bytes: Uint8Array): string {
+    let out = '';
+    let i = 0;
+    while (i < bytes.length) {
+      const c = bytes[i++];
+      if (c < 0x80) {
+        out += String.fromCharCode(c);
+      } else if (c >= 0xc0 && c < 0xe0) {
+        const c2 = bytes[i++];
+        out += String.fromCharCode(((c & 0x1f) << 6) | (c2 & 0x3f));
+      } else if (c >= 0xe0 && c < 0xf0) {
+        const c2 = bytes[i++];
+        const c3 = bytes[i++];
+        out += String.fromCharCode(((c & 0x0f) << 12) | ((c2 & 0x3f) << 6) | (c3 & 0x3f));
+      } else {
+        // 4-byte UTF-8 -> surrogate pair
+        const c2 = bytes[i++];
+        const c3 = bytes[i++];
+        const c4 = bytes[i++];
+        let codepoint = ((c & 0x07) << 18) | ((c2 & 0x3f) << 12) | ((c3 & 0x3f) << 6) | (c4 & 0x3f);
+        codepoint -= 0x10000;
+        out += String.fromCharCode((codepoint >> 10) + 0xd800);
+        out += String.fromCharCode((codepoint & 0x3ff) + 0xdc00);
+      }
+    }
+    return out;
+  }
+
   private cycleStart(): void {
-    this.startIndex = (this.startIndex + 1) % this.poiList.length;
+    const combined = this.getCombinedList();
+    this.startIndex = (this.startIndex + 1) % combined.length;
     if (this.startIndex === this.endIndex) {
-      this.endIndex = (this.endIndex + 1) % this.poiList.length;
+      this.endIndex = (this.endIndex + 1) % combined.length;
     }
     this.updateMarkers();
   }
 
   private cycleEnd(): void {
-    this.endIndex = (this.endIndex + 1) % this.poiList.length;
+    const combined = this.getCombinedList();
+    this.endIndex = (this.endIndex + 1) % combined.length;
     if (this.endIndex === this.startIndex) {
-      this.startIndex = (this.startIndex + 1) % this.poiList.length;
+      this.startIndex = (this.startIndex + 1) % combined.length;
     }
     this.updateMarkers();
   }
@@ -84,18 +126,30 @@ struct Index {
   }
 
   private getSelectOptions(): Array<SelectOption> {
+    const filtered: Array<POI> = this.getFilteredList();
     const options: Array<SelectOption> = new Array<SelectOption>();
-    for (let i = 0; i < this.poiList.length; i++) {
-      const poi: POI = this.poiList[i];
+    for (let i = 0; i < filtered.length; i++) {
+      const poi: POI = filtered[i];
       const opt: SelectOption = { value: poi.name, text: poi.name };
       options.push(opt);
     }
     return options;
   }
 
+  private getFilteredList(): Array<POI> {
+    // Host no longer filters POIs; selection/search is handled in the webview.
+    return this.getCombinedList();
+  }
+
+  private getCombinedList(): Array<POI> {
+    // For host-side operations we only keep the built-in POI list.
+    return this.poiList.slice();
+  }
+
   private updateMarkers(): void {
-    const start: POI = this.poiList[this.startIndex];
-    const end: POI = this.poiList[this.endIndex];
+    const combined = this.getCombinedList();
+    const start: POI = combined[this.startIndex] || this.poiList[0];
+    const end: POI = combined[this.endIndex] || this.poiList[1] || combined[0];
     const markers: Array<Marker> = new Array<Marker>();
     const startMarker: Marker = { lat: start.lat, lon: start.lon, label: '起点 ' + start.name };
     const endMarker: Marker = { lat: end.lat, lon: end.lon, label: '终点 ' + end.name };
@@ -106,8 +160,9 @@ struct Index {
   }
 
   private planRoute(): void {
-    const start: POI = this.poiList[this.startIndex];
-    const end: POI = this.poiList[this.endIndex];
+    const combined = this.getCombinedList();
+    const start: POI = combined[this.startIndex] || this.poiList[0];
+    const end: POI = combined[this.endIndex] || this.poiList[1] || combined[0];
     const startPayload: Marker = { lat: start.lat, lon: start.lon };
     const endPayload: Marker = { lat: end.lat, lon: end.lon };
     const payload: RoutePayload = { start: startPayload, end: endPayload };
@@ -115,83 +170,58 @@ struct Index {
     this.webController.runJavaScript(script);
   }
 
+  private computeSelectedIndexForStart(): number {
+    const filtered: Array<POI> = this.getFilteredList();
+    const combined: Array<POI> = this.getCombinedList();
+    const current: POI | undefined = combined[this.startIndex];
+    if (!current) {
+      return 0;
+    }
+    for (let i = 0; i < filtered.length; i++) {
+      const p: POI = filtered[i];
+      if (p.name === current.name && p.lat === current.lat && p.lon === current.lon) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  private computeSelectedIndexForEnd(): number {
+    const filtered: Array<POI> = this.getFilteredList();
+    const combined: Array<POI> = this.getCombinedList();
+    const current: POI | undefined = combined[this.endIndex];
+    if (!current) {
+      return 0;
+    }
+    for (let i = 0; i < filtered.length; i++) {
+      const p: POI = filtered[i];
+      if (p.name === current.name && p.lat === current.lat && p.lon === current.lon) {
+        return i;
+      }
+    }
+    return 0;
+  }
+
   private clearRoute(): void {
     const script = 'window.clearRoute && window.clearRoute();';
     this.webController.runJavaScript(script);
   }
 
+  // onPageEnd handler must be a named method (avoid nested inline functions)
+  private onWebPageEnd(): void {
+    this.injectOsmToWeb();
+  }
+
   build() {
+    // Single root stack containing the Web component. Keep chaining on the root.
     Stack() {
       Web({
         src: 'resource://rawfile/custom_map.html',
         controller: this.webController
       })
-        .onPageEnd(() => {
-          this.injectOsmToWeb();
-        })
+        .onPageEnd(this.onWebPageEnd.bind(this))
         .width('100%')
         .height('100%');
-
-      Row() {
-        Text('本地 OSM 地图 · 支持双指缩放与拖动')
-          .fontSize(14)
-          .fontColor(Color.White)
-          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-          .backgroundColor('rgba(0, 0, 0, 0.55)')
-          .borderRadius(16);
-      }
-      .width('100%')
-      .justifyContent(FlexAlign.Center)
-      .margin({ top: 18 });
-
-      Column() {
-        Row() {
-          Text('起点').fontColor(Color.White).fontSize(13).opacity(0.85);
-          Select(this.getSelectOptions())
-            .selected(this.startIndex)
-            .margin({ left: 8 })
-            .onSelect((index: number) => {
-              if (index >= 0 && index < this.poiList.length) {
-                this.startIndex = index;
-                if (this.startIndex === this.endIndex) {
-                  this.endIndex = (this.endIndex + 1) % this.poiList.length;
-                }
-                this.updateMarkers();
-              }
-            });
-        }
-        .width('100%')
-        .padding({ bottom: 8 });
-
-        Row() {
-          Text('终点').fontColor(Color.White).fontSize(13).opacity(0.85);
-          Select(this.getSelectOptions())
-            .selected(this.endIndex)
-            .margin({ left: 8 })
-            .onSelect((index: number) => {
-              if (index >= 0 && index < this.poiList.length) {
-                this.endIndex = index;
-                if (this.endIndex === this.startIndex) {
-                  this.startIndex = (this.startIndex + 1) % this.poiList.length;
-                }
-                this.updateMarkers();
-              }
-            });
-        }
-        .width('100%')
-        .padding({ bottom: 12 });
-
-        Row() {
-          Button('规划路线').fontSize(12).onClick(() => this.planRoute());
-          Button('清除').fontSize(12).margin({ left: 8 }).onClick(() => this.clearRoute());
-        }
-      }
-      .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-      .backgroundColor('rgba(0, 0, 0, 0.45)')
-      .borderRadius(12)
-      .width('92%')
-      .margin({ top: 70 })
-      .align(Alignment.TopStart);
     }
     .width('100%')
     .height('100%');

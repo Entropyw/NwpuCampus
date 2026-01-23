@@ -21,18 +21,7 @@
       touch-action: none;
     }
     .badge {
-      position: absolute;
-      left: 50%;
-      top: 16px;
-      transform: translateX(-50%);
-      background: rgba(255, 255, 255, 0.88);
-      color: #27324a;
-      padding: 8px 14px;
-      border-radius: 18px;
-      font-size: 13px;
-      letter-spacing: 0.4px;
-      box-shadow: 0 6px 16px rgba(27, 38, 56, 0.12);
-      pointer-events: none;
+      display: none;
     }
     .controls {
       position: absolute;
@@ -41,7 +30,8 @@
       display: flex;
       flex-direction: column;
       gap: 10px;
-      z-index: 10;
+      z-index: 1000; /* ensure controls sit above canvas and other layers */
+      pointer-events: auto; /* explicitly allow pointer events */
     }
     .control-btn {
       width: 44px;
@@ -65,21 +55,116 @@
       height: 36px;
       border-radius: 18px;
     }
+    .poi-panel {
+      position: absolute;
+      left: 16px;
+      top: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: rgba(28, 33, 45, 0.72);
+      color: #fff;
+      padding: 12px;
+      border-radius: 12px;
+      box-shadow: 0 8px 18px rgba(22, 34, 51, 0.18);
+      z-index: 1000;
+      width: 220px;
+      font-size: 12px;
+    }
+    .poi-panel label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .poi-panel input,
+    .poi-panel select {
+      height: 32px;
+      border-radius: 8px;
+      border: none;
+      padding: 0 10px;
+      font-size: 12px;
+    }
+    .poi-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .poi-actions button {
+      flex: 1;
+      height: 32px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      color: #2b3347;
+      font-weight: 600;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
   <canvas id="map"></canvas>
   <div class="badge">自定义地图 · 支持拖动与双指缩放</div>
+  <div class="poi-panel">
+    <label>
+      搜索 POI
+      <input id="poiSearch" type="text" placeholder="输入地点名称" />
+    </label>
+    <label>
+      起点
+      <select id="startSelect"></select>
+    </label>
+    <label>
+      终点
+      <select id="endSelect"></select>
+    </label>
+    <div class="poi-actions">
+      <button id="planRouteBtn">规划路线</button>
+      <button id="clearRouteBtn">清除</button>
+    </div>
+  </div>
   <div class="controls">
     <button class="control-btn" id="zoomIn">+</button>
     <button class="control-btn" id="zoomOut">−</button>
     <button class="control-btn theme-toggle" id="themeToggle">日间</button>
   </div>
+  <!-- Visible overlay to show uncaught JS errors inside the WebView (helpful for debugging crashes) -->
+  <div id="errorOverlay" style="display:none; position: absolute; left: 16px; right:16px; top: 50%; transform: translateY(-50%); background: rgba(200,20,20,0.95); color: #fff; padding: 12px; border-radius: 8px; z-index:2000; font-size:14px; white-space: pre-wrap; max-height:60%; overflow:auto;"></div>
 
   <script>
     const canvas = document.getElementById('map');
     const ctx = canvas.getContext('2d');
-    const badge = document.querySelector('.badge');
+    const errorOverlay = document.getElementById('errorOverlay');
+
+    function showErrorOverlay(msg) {
+      try {
+        if (errorOverlay) {
+          errorOverlay.style.display = 'block';
+          errorOverlay.textContent = String(msg);
+        }
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('WebView uncaught error:', msg);
+        }
+        // also set a visible badge for quick attention
+        try { setBadge && setBadge('脚本异常，查看日志'); } catch (e) {}
+      } catch (e) {
+        // swallow
+      }
+    }
+
+    window.addEventListener('error', function (ev) {
+      const msg = ev && ev.message ? ev.message + '\n' + (ev.filename || '') + ':' + (ev.lineno || '') : String(ev);
+      showErrorOverlay(msg);
+    });
+
+    window.addEventListener('unhandledrejection', function (ev) {
+      const reason = ev && ev.reason ? ev.reason : ev;
+      showErrorOverlay('UnhandledRejection: ' + (reason && reason.message ? reason.message : String(reason)));
+    });
+  const badge = document.querySelector('.badge');
+  const poiSearch = document.getElementById('poiSearch');
+  const startSelect = document.getElementById('startSelect');
+  const endSelect = document.getElementById('endSelect');
+  const planRouteBtn = document.getElementById('planRouteBtn');
+  const clearRouteBtn = document.getElementById('clearRouteBtn');
     const zoomInButton = document.getElementById('zoomIn');
     const zoomOutButton = document.getElementById('zoomOut');
     const themeToggle = document.getElementById('themeToggle');
@@ -96,6 +181,7 @@
         label: '#263042',
         labelHalo: 'rgba(255, 255, 255, 0.92)',
         poi: '#2f7df6',
+  route: '#1866ff',
         road: {
           motorway: { width: 5.2, color: '#f5c48b', casing: '#d9b07a' },
           trunk: { width: 4.8, color: '#f3d6a4', casing: '#d2b489' },
@@ -120,6 +206,8 @@
         label: '#e5ecff',
         labelHalo: 'rgba(20, 24, 33, 0.85)',
         poi: '#6ea8ff',
+        // brighter yellow for night routes
+        route: '#ffd54f',
         road: {
           motorway: { width: 5.2, color: '#c18b4b', casing: '#7d5c35' },
           trunk: { width: 4.8, color: '#b69063', casing: '#6e5639' },
@@ -163,10 +251,13 @@
       pitches: [],
       labels: []
     };
-    const customMarkers = [];
-    const graph = { nodes: new Map(), adj: new Map() };
-    let routePolyline = [];
-    let routeInfo = null;
+  const customMarkers = [];
+  let currentRoute = null;
+  let routePath = [];
+  let labelPoiList = [];
+  let roadGraph = { nodes: [], adj: [] };
+  let currentAnimationToken = 0;
+  let pendingRouteTimer = null;
     let showAutoLabels = true;
     let mapWidth = 2000;
     let mapHeight = 2000;
@@ -236,14 +327,7 @@
       const lonSpan = bounds.maxLon - bounds.minLon;
       const latSpan = bounds.maxLat - bounds.minLat;
       mapWidth = 2000;
-      if (!Number.isFinite(lonSpan) || !Number.isFinite(latSpan) || lonSpan <= 0 || latSpan <= 0) {
-        mapHeight = 2000;
-        return;
-      }
       mapHeight = mapWidth * (latSpan / lonSpan);
-      if (!Number.isFinite(mapHeight) || mapHeight <= 0) {
-        mapHeight = 2000;
-      }
     }
 
     function getCentroid(points) {
@@ -263,29 +347,9 @@
       const bounds = renderData.bounds;
       const lonSpan = bounds.maxLon - bounds.minLon;
       const latSpan = bounds.maxLat - bounds.minLat;
-      if (!Number.isFinite(lonSpan) || !Number.isFinite(latSpan) || lonSpan <= 0 || latSpan <= 0) {
-        return { x: 0, y: 0 };
-      }
       const x = ((lon - bounds.minLon) / lonSpan) * mapWidth;
       const y = ((bounds.maxLat - lat) / latSpan) * mapHeight;
       return { x, y };
-    }
-
-    function addEdge(nodeIdA, nodeIdB, weight) {
-      if (!graph.adj.has(nodeIdA)) {
-        graph.adj.set(nodeIdA, []);
-      }
-      if (!graph.adj.has(nodeIdB)) {
-        graph.adj.set(nodeIdB, []);
-      }
-      graph.adj.get(nodeIdA).push({ to: nodeIdB, w: weight });
-      graph.adj.get(nodeIdB).push({ to: nodeIdA, w: weight });
-    }
-
-    function distanceMeters(lat1, lon1, lat2, lon2) {
-      const dx = (lon2 - lon1) * 111320 * Math.cos(((lat1 + lat2) / 2) * Math.PI / 180);
-      const dy = (lat2 - lat1) * 110540;
-      return Math.hypot(dx, dy);
     }
 
     function buildRenderData(xmlDoc) {
@@ -295,8 +359,6 @@
       renderData.waters = [];
   renderData.pitches = [];
       renderData.labels = [];
-      graph.nodes = new Map();
-      graph.adj = new Map();
 
       const nodes = new Map();
       const nodeElements = xmlDoc.getElementsByTagName('node');
@@ -309,7 +371,6 @@
         }
         const tags = parseTags(node);
         nodes.set(id, { lat, lon, tags });
-        graph.nodes.set(id, { lat, lon });
 
         const name = tags.name;
         const isLabel = Boolean(name && (tags.amenity || tags.shop || tags.tourism || tags.barrier || tags.man_made || tags.building));
@@ -372,17 +433,6 @@
               priority: 1
             });
           }
-          for (let i = 1; i < nodeRefs.length; i++) {
-            const prevId = nodeRefs[i - 1].getAttribute('ref');
-            const currId = nodeRefs[i].getAttribute('ref');
-            const prevNode = prevId ? nodes.get(prevId) : null;
-            const currNode = currId ? nodes.get(currId) : null;
-            if (!prevNode || !currNode) {
-              continue;
-            }
-            const w = distanceMeters(prevNode.lat, prevNode.lon, currNode.lat, currNode.lon);
-            addEdge(prevId, currId, w);
-          }
           continue;
         }
 
@@ -409,6 +459,65 @@
           }
         }
       }
+      buildRoadGraph();
+      // rebuild label POI list to align with actual rendered labels
+      labelPoiList = renderData.labels.map((label) => ({
+        name: label.name,
+        position: label.position
+      }));
+      // de-duplicate by name
+      const seen = new Set();
+      labelPoiList = labelPoiList.filter((item) => {
+        if (seen.has(item.name)) return false;
+        seen.add(item.name);
+        return true;
+      });
+      updatePoiSelects();
+    }
+
+    function buildRoadGraph() {
+      const nodes = [];
+      const adj = [];
+      const keyMap = new Map();
+
+      const keyFor = (p) => {
+        const rx = Math.round(p.x * 2) / 2;
+        const ry = Math.round(p.y * 2) / 2;
+        return `${rx},${ry}`;
+      };
+
+      const addNode = (p) => {
+        const key = keyFor(p);
+        if (keyMap.has(key)) {
+          return keyMap.get(key);
+        }
+        const idx = nodes.length;
+        nodes.push({ x: p.x, y: p.y });
+        adj.push([]);
+        keyMap.set(key, idx);
+        return idx;
+      };
+
+      const addEdge = (aIdx, bIdx, w) => {
+        adj[aIdx].push({ to: bIdx, w });
+        adj[bIdx].push({ to: aIdx, w });
+      };
+
+      for (const road of renderData.roads) {
+        const pts = road.points;
+        for (let i = 1; i < pts.length; i++) {
+          const a = pts[i - 1];
+          const b = pts[i];
+          const aIdx = addNode(a);
+          const bIdx = addNode(b);
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          const dist = Math.hypot(dx, dy);
+          addEdge(aIdx, bIdx, dist);
+        }
+      }
+
+      roadGraph = { nodes, adj };
     }
 
     function fitToView() {
@@ -417,13 +526,10 @@
       const padding = 24;
       const scaleX = (viewportWidth - padding * 2) / mapWidth;
       const scaleY = (viewportHeight - padding * 2) / mapHeight;
-      let nextScale = clampScale(Math.min(scaleX, scaleY));
-      if (!Number.isFinite(nextScale) || nextScale <= 0) {
-        nextScale = 1;
-      }
+      const nextScale = clampScale(Math.min(scaleX, scaleY));
       state.scale = nextScale;
-      state.minScale = nextScale * 0.6;
-      state.maxScale = nextScale * 6;
+      state.minScale = nextScale * 0.4;
+      state.maxScale = nextScale * 10;
       state.offsetX = (viewportWidth - mapWidth * nextScale) / 2;
       state.offsetY = (viewportHeight - mapHeight * nextScale) / 2;
     }
@@ -508,28 +614,6 @@
       }
     }
 
-    function drawRoute() {
-      if (!routePolyline.length || routePolyline.length < 2) {
-        return;
-      }
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-      ctx.strokeStyle = 'rgba(59, 130, 246, 0.75)';
-      ctx.lineWidth = 10 / state.scale;
-      drawPath(routePolyline, false);
-      ctx.stroke();
-
-      ctx.strokeStyle = '#1d4ed8';
-      ctx.lineWidth = 6 / state.scale;
-      drawPath(routePolyline, false);
-      ctx.stroke();
-
-      ctx.strokeStyle = '#93c5fd';
-      ctx.lineWidth = 2.5 / state.scale;
-      drawPath(routePolyline, false);
-      ctx.stroke();
-    }
-
     function drawLabels() {
       if (!showAutoLabels || state.scale < 0.7) {
         return;
@@ -598,6 +682,211 @@
       ctx.restore();
     }
 
+    function drawRoute() {
+      if (!routePath || routePath.length < 2) return;
+  const theme = THEMES[currentTheme];
+  ctx.strokeStyle = theme.route || theme.poi;
+      ctx.lineWidth = 4 / state.scale;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(routePath[0].x, routePath[0].y);
+      for (let i = 1; i < routePath.length; i++) {
+        ctx.lineTo(routePath[i].x, routePath[i].y);
+      }
+      ctx.stroke();
+    }
+
+    function nearestNodeIndex(point) {
+      if (!roadGraph || !roadGraph.nodes.length) return -1;
+      let bestIdx = -1;
+      let bestDist = Infinity;
+      for (let i = 0; i < roadGraph.nodes.length; i++) {
+        const n = roadGraph.nodes[i];
+        const dx = n.x - point.x;
+        const dy = n.y - point.y;
+        const d = dx * dx + dy * dy;
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+
+    function focusOnRoute(pathPoints, preferZoomFactor = 1.4) {
+      if (!pathPoints || pathPoints.length === 0) return;
+      // compute bounding box of route points
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of pathPoints) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      // choose scale so the route fits comfortably
+      const viewportWidth = canvas.width / state.dpr;
+      const viewportHeight = canvas.height / state.dpr;
+      const padding = 80; // CSS px padding
+      const routeWidth = Math.max(1, maxX - minX);
+      const routeHeight = Math.max(1, maxY - minY);
+      const scaleX = (viewportWidth - padding * 2) / routeWidth;
+      const scaleY = (viewportHeight - padding * 2) / routeHeight;
+      let desiredScale = clampScale(Math.min(scaleX, scaleY) * preferZoomFactor);
+      // Prevent automatic zoom-out: if computed desiredScale is smaller than current
+      // scale we'll keep at least the current scale (so planning doesn't make the map shrink).
+      if (desiredScale < state.scale) {
+        desiredScale = clampScale(state.scale);
+      }
+      // animate zoom then center to computed center
+      animateZoomThenCenter({ x: centerX, y: centerY }, desiredScale, 420);
+    }
+
+    function dijkstra(startIdx, endIdx) {
+      // Dijkstra with iteration cap to avoid long blocking on large graphs.
+      const n = roadGraph.nodes.length;
+      const dist = new Array(n).fill(Infinity);
+      const prev = new Array(n).fill(-1);
+      const visited = new Array(n).fill(false);
+      dist[startIdx] = 0;
+      const maxIterations = Math.max(10000, n * 4); // safety cap
+      let iterations = 0;
+      for (let i = 0; i < n; i++) {
+        if (++iterations > maxIterations) {
+          console.warn('Dijkstra aborted after max iterations', iterations);
+          return null; // signal abort
+        }
+        let u = -1;
+        let best = Infinity;
+        for (let j = 0; j < n; j++) {
+          if (!visited[j] && dist[j] < best) {
+            best = dist[j];
+            u = j;
+          }
+        }
+        if (u === -1) break;
+        if (u === endIdx) break;
+        visited[u] = true;
+        const edges = roadGraph.adj[u];
+        for (const e of edges) {
+          const alt = dist[u] + e.w;
+          if (alt < dist[e.to]) {
+            dist[e.to] = alt;
+            prev[e.to] = u;
+          }
+        }
+      }
+      const path = [];
+      let cur = endIdx;
+      while (cur !== -1) {
+        path.push(roadGraph.nodes[cur]);
+        cur = prev[cur];
+      }
+      path.reverse();
+      return path;
+    }
+
+    function computeRoutePath(startPoint, endPoint) {
+      if (!roadGraph || !roadGraph.nodes.length) return [];
+      const startIdx = nearestNodeIndex(startPoint);
+      const endIdx = nearestNodeIndex(endPoint);
+      if (startIdx < 0 || endIdx < 0) return [];
+      const path = dijkstra(startIdx, endIdx);
+      if (!path || path.length === 0) {
+        // fallback to straight line if dijkstra aborted or produced no path
+        return [startPoint, endPoint];
+      }
+      return [startPoint, ...path, endPoint];
+    }
+
+    function focusOnPoint(pt, zoomFactor = 1.4) {
+      if (!pt) return;
+      const viewportWidth = canvas.width / state.dpr;
+      const viewportHeight = canvas.height / state.dpr;
+      const targetScale = clampScale(state.scale * zoomFactor);
+      const targetOffsetX = viewportWidth / 2 - pt.x * targetScale;
+      const targetOffsetY = viewportHeight / 2 - pt.y * targetScale;
+      // Smoothly animate: first zoom, then pan to center (avoids post-zoom shift)
+      animateZoomThenCenter(pt, targetScale, 350);
+    }
+
+    function animateZoomThenCenter(pt, targetScale, durationMs) {
+      const myToken = ++currentAnimationToken; // capture a unique token for this animation
+      const half = Math.max(20, durationMs / 2);
+      const startScale = state.scale;
+      const startOffsetX = state.offsetX;
+      const startOffsetY = state.offsetY;
+      const ease = function (t) { return 1 - Math.pow(1 - t, 3); }; // easeOutCubic
+
+      // Phase 1: animate scale only
+      const t0 = performance.now();
+      function stepScale(now) {
+        if (myToken !== currentAnimationToken) return; // cancelled
+        const t = Math.min(1, (now - t0) / half);
+        const eased = ease(t);
+        state.scale = startScale + (targetScale - startScale) * eased;
+        // keep offsets while zooming to avoid moving the focus point until scale completes
+        state.offsetX = startOffsetX;
+        state.offsetY = startOffsetY;
+        draw();
+        if (t < 1) {
+          requestAnimationFrame(stepScale);
+        } else {
+          if (myToken !== currentAnimationToken) return; // cancelled
+          // Phase 2: compute final offsets and animate panning
+          const viewportWidth = canvas.width / state.dpr;
+          const viewportHeight = canvas.height / state.dpr;
+          // Account for UI overlays (poi panel on the left) so the point is centered
+          // within the unobstructed map area. If the panel is visible, shift center
+          // to the right by half the panel width so the map point appears centered
+          // in the remaining view.
+          let overlayShiftX = 0;
+          let overlayShiftY = 0;
+          try {
+            const panel = document.querySelector('.poi-panel');
+            if (panel) {
+              const rect = panel.getBoundingClientRect();
+              const style = window.getComputedStyle(panel);
+              if (style && style.display !== 'none' && rect.width > 8) {
+                overlayShiftX = rect.width / 2;
+              }
+            }
+            // top overlays (e.g., badge) may push visual center down; shift by half height
+            const badgeEl = document.querySelector('.badge');
+            if (badgeEl) {
+              const brect = badgeEl.getBoundingClientRect();
+              const bstyle = window.getComputedStyle(badgeEl);
+              if (bstyle && bstyle.display !== 'none' && brect.height > 6) {
+                overlayShiftY = brect.height / 2;
+              }
+            }
+          } catch (e) {
+            overlayShiftX = 0;
+            overlayShiftY = 0;
+          }
+          const finalOffsetX = viewportWidth / 2 + overlayShiftX - pt.x * state.scale;
+          const finalOffsetY = viewportHeight / 2 + overlayShiftY - pt.y * state.scale;
+          const panStartX = state.offsetX;
+          const panStartY = state.offsetY;
+          const t1 = performance.now();
+          function stepPan(now2) {
+            if (myToken !== currentAnimationToken) return; // cancelled
+            const tt = Math.min(1, (now2 - t1) / half);
+            const e2 = ease(tt);
+            state.offsetX = panStartX + (finalOffsetX - panStartX) * e2;
+            state.offsetY = panStartY + (finalOffsetY - panStartY) * e2;
+            draw();
+            if (tt < 1) {
+              requestAnimationFrame(stepPan);
+            }
+          }
+          requestAnimationFrame(stepPan);
+        }
+      }
+      requestAnimationFrame(stepScale);
+    }
+
     function fetchWithXHR(url) {
       return new Promise((resolve, reject) => {
         const request = new XMLHttpRequest();
@@ -630,17 +919,42 @@
     }
 
     function loadOSMFromText(text, sourceLabel) {
-      const xmlDoc = new DOMParser().parseFromString(text, 'text/xml');
-      const bounds = parseBounds(xmlDoc);
-      if (!bounds) {
-        throw new Error('OSM bounds 解析失败');
+      // Defensive: avoid attempting to parse extremely large OSM payloads which
+      // may exhaust memory or crash the WebView/renderer on some devices.
+      try {
+        const maxBytes = 5 * 1024 * 1024; // 5 MB
+        if (typeof text === 'string' && text.length > maxBytes) {
+          loadError = new Error('OSM 文件过大，跳过解析（>5MB）');
+          setBadge('OSM 文件过大，等待主机注入或使用更小的地图');
+          console.error('Skipped parsing large OSM payload, length=', text.length);
+          return;
+        }
+
+        const xmlDoc = new DOMParser().parseFromString(text, 'text/xml');
+        const bounds = parseBounds(xmlDoc);
+        if (!bounds) {
+          throw new Error('OSM bounds 解析失败');
+        }
+        renderData.bounds = bounds;
+        computeMapSize(bounds);
+        // build data structures; wrap in try/catch because this can be heavy
+        try {
+          buildRenderData(xmlDoc);
+        } catch (innerErr) {
+          console.error('buildRenderData failed:', innerErr);
+          loadError = innerErr instanceof Error ? innerErr : new Error(String(innerErr));
+          setBadge('OSM 解析失败，查看日志');
+          return;
+        }
+        dataReady = true;
+        fitToView();
+        setBadge(sourceLabel || '本地 OSM 地图 · 支持双指缩放与拖动');
+      } catch (err) {
+        loadError = err instanceof Error ? err : new Error(String(err));
+        console.error('loadOSMFromText parse failed:', loadError);
+        setBadge('OSM 解析异常，等待注入');
+        return;
       }
-      renderData.bounds = bounds;
-      computeMapSize(bounds);
-      buildRenderData(xmlDoc);
-      dataReady = true;
-      fitToView();
-      setBadge(sourceLabel || '本地 OSM 地图 · 支持双指缩放与拖动');
     }
 
     async function loadOSM() {
@@ -741,6 +1055,135 @@
       draw();
     };
 
+    function updatePoiSelects() {
+      if (!startSelect || !endSelect) return;
+      const keyword = poiSearch && typeof poiSearch.value === 'string' ? poiSearch.value.trim() : '';
+      const list = keyword
+        ? labelPoiList.filter((p) => p.name.indexOf(keyword) >= 0)
+        : labelPoiList;
+
+      const buildOptions = (selectEl) => {
+        selectEl.innerHTML = '';
+        list.forEach((poi, idx) => {
+          const opt = document.createElement('option');
+          opt.value = String(idx);
+          opt.textContent = poi.name;
+          selectEl.appendChild(opt);
+        });
+      };
+
+      buildOptions(startSelect);
+      buildOptions(endSelect);
+      if (list.length > 1) {
+        endSelect.selectedIndex = Math.min(1, list.length - 1);
+      }
+    }
+
+    function getSelectedPoi(selectEl) {
+      const keyword = poiSearch && typeof poiSearch.value === 'string' ? poiSearch.value.trim() : '';
+      const list = keyword
+        ? labelPoiList.filter((p) => p.name.indexOf(keyword) >= 0)
+        : labelPoiList;
+      const idx = selectEl.selectedIndex;
+      return list[idx] || null;
+    }
+
+    function setRouteFromSelection() {
+      if (!startSelect || !endSelect) return;
+      const start = getSelectedPoi(startSelect);
+      const end = getSelectedPoi(endSelect);
+      if (!start || !end) return;
+      const startPoint = { x: start.position.x, y: start.position.y };
+      const endPoint = { x: end.position.x, y: end.position.y };
+      // schedule route computation briefly to let UI update and allow cancel
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      setBadge('正在规划路线…');
+      pendingRouteTimer = setTimeout(() => {
+        pendingRouteTimer = null;
+        // guard for extremely large road graphs: avoid blocking Dijkstra
+        if (roadGraph && roadGraph.nodes && roadGraph.nodes.length > 3000) {
+          console.warn('Road graph large (', roadGraph.nodes.length, '), falling back to straight-line route');
+          routePath = [startPoint, endPoint];
+        } else {
+          try {
+            routePath = computeRoutePath(startPoint, endPoint);
+          } catch (err) {
+            console.error('computeRoutePath failed:', err);
+            routePath = [startPoint, endPoint];
+          }
+        }
+        currentRoute = { start: startPoint, end: endPoint };
+        // focus on the computed route's midpoint/bounds so both ends are visible
+        currentAnimationToken += 1;
+        if (routePath && routePath.length > 1) {
+          focusOnRoute(routePath, 2.0);
+        } else {
+          focusOnPoint(startPoint, 2.0);
+        }
+        setBadge('路线已规划');
+        draw();
+      }, 60);
+    }
+
+    window.setRoute = (payload) => {
+      if (!payload || !payload.start || !payload.end) return;
+      let startPoint;
+      let endPoint;
+      if (typeof payload.start.x === 'number') {
+        startPoint = { x: payload.start.x, y: payload.start.y };
+      } else {
+        startPoint = project(payload.start.lat, payload.start.lon);
+      }
+      if (typeof payload.end.x === 'number') {
+        endPoint = { x: payload.end.x, y: payload.end.y };
+      } else {
+        endPoint = project(payload.end.lat, payload.end.lon);
+      }
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      setBadge('正在规划路线…');
+      pendingRouteTimer = setTimeout(() => {
+        pendingRouteTimer = null;
+        if (roadGraph && roadGraph.nodes && roadGraph.nodes.length > 3000) {
+          console.warn('Road graph large (', roadGraph.nodes.length, '), falling back to straight-line route');
+          routePath = [startPoint, endPoint];
+        } else {
+          try {
+            routePath = computeRoutePath(startPoint, endPoint);
+          } catch (err) {
+            console.error('computeRoutePath failed:', err);
+            routePath = [startPoint, endPoint];
+          }
+        }
+        currentRoute = payload;
+        // cancel any previous animations and start new focus
+        currentAnimationToken += 1;
+        focusOnPoint(startPoint, 2.0);
+        setBadge('路线已规划');
+        draw();
+      }, 60);
+    };
+
+    window.clearRoute = () => {
+      // cancel animations and clear route
+      currentAnimationToken += 1;
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      currentRoute = null;
+      routePath = [];
+      // reset any dragging state so user interaction resumes
+      state.dragging = false;
+      setBadge('');
+      draw();
+    };
+
     window.addCustomMarker = (marker) => {
       if (marker && typeof marker.lat === 'number' && typeof marker.lon === 'number') {
         customMarkers.push({
@@ -757,232 +1200,14 @@
       draw();
     };
 
-    function findNearestNode(lat, lon) {
-      let bestId = null;
-      let bestDist = Number.POSITIVE_INFINITY;
-      for (const [id, node] of graph.nodes.entries()) {
-        const edges = graph.adj.get(id);
-        if (!edges || edges.length === 0) {
-          continue;
-        }
-        if (!Number.isFinite(node.lat) || !Number.isFinite(node.lon)) {
-          continue;
-        }
-        const dist = distanceMeters(lat, lon, node.lat, node.lon);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestId = id;
-        }
+    function setTheme(nextTheme) {
+      currentTheme = nextTheme in THEMES ? nextTheme : 'day';
+      document.body.style.background = THEMES[currentTheme].background;
+      if (themeToggle) {
+        themeToggle.textContent = currentTheme === 'day' ? '日间' : '夜间';
       }
-      return { id: bestId, dist: bestDist };
-    }
-
-    // 简易二叉堆实现的最小优先队列，用于 Dijkstra
-    class MinHeap {
-      constructor() {
-        this.items = [];
-      }
-
-      push(item) {
-        this.items.push(item);
-        this.up(this.items.length - 1);
-      }
-
-      pop() {
-        if (!this.items.length) {
-          return null;
-        }
-        const root = this.items[0];
-        const last = this.items.pop();
-        if (this.items.length && last) {
-          this.items[0] = last;
-          this.down(0);
-        }
-        return root;
-      }
-
-      up(idx) {
-        while (idx > 0) {
-          const parent = (idx - 1) >> 1;
-          if (this.items[parent].d <= this.items[idx].d) {
-            break;
-          }
-          this.swap(parent, idx);
-          idx = parent;
-        }
-      }
-
-      down(idx) {
-        const n = this.items.length;
-        while (true) {
-          let smallest = idx;
-          const left = (idx << 1) + 1;
-          const right = (idx << 1) + 2;
-          if (left < n && this.items[left].d < this.items[smallest].d) {
-            smallest = left;
-          }
-          if (right < n && this.items[right].d < this.items[smallest].d) {
-            smallest = right;
-          }
-          if (smallest === idx) {
-            break;
-          }
-          this.swap(idx, smallest);
-          idx = smallest;
-        }
-      }
-
-      swap(a, b) {
-        const tmp = this.items[a];
-        this.items[a] = this.items[b];
-        this.items[b] = tmp;
-      }
-
-      isEmpty() {
-        return this.items.length === 0;
-      }
-    }
-
-    function shortestPath(startId, endId) {
-      const dist = new Map();
-      const prev = new Map();
-      const visited = new Set();
-      dist.set(startId, 0);
-      const heap = new MinHeap();
-      heap.push({ id: startId, d: 0 });
-      while (!heap.isEmpty()) {
-        const current = heap.pop();
-        if (!current) {
-          continue;
-        }
-        if (visited.has(current.id)) {
-          continue;
-        }
-        visited.add(current.id);
-        if (current.id === endId) {
-          break;
-        }
-        const edges = graph.adj.get(current.id) || [];
-        for (const edge of edges) {
-          const nd = current.d + edge.w;
-          const old = dist.get(edge.to);
-          if (nd < (old ?? Number.POSITIVE_INFINITY)) {
-            dist.set(edge.to, nd);
-            prev.set(edge.to, current.id);
-            heap.push({ id: edge.to, d: nd });
-          }
-        }
-      }
-      if (!prev.has(endId) && startId !== endId) {
-        return null;
-      }
-      const path = [];
-      let cur = endId;
-      path.push(cur);
-      while (prev.has(cur)) {
-        cur = prev.get(cur);
-        path.push(cur);
-      }
-      return path.reverse();
-    }
-
-    function buildPolylineFromNodes(pathIds) {
-      const line = [];
-      for (const id of pathIds) {
-        const node = graph.nodes.get(id);
-        if (!node) continue;
-        const pt = project(node.lat, node.lon);
-        if (Number.isFinite(pt.x) && Number.isFinite(pt.y)) {
-          line.push(pt);
-        }
-      }
-      // 防止过长路径导致绘制异常，必要时做抽稀
-      const maxPoints = 8000;
-      if (line.length > maxPoints) {
-        const step = Math.ceil(line.length / maxPoints);
-        const sampled = [];
-        for (let i = 0; i < line.length; i += step) {
-          sampled.push(line[i]);
-        }
-        if (line.length % step !== 0) {
-          sampled.push(line[line.length - 1]);
-        }
-        return sampled;
-      }
-      return line;
-    }
-
-    function calcRouteDistance(pathIds) {
-      let total = 0;
-      for (let i = 1; i < pathIds.length; i++) {
-        const a = graph.nodes.get(pathIds[i - 1]);
-        const b = graph.nodes.get(pathIds[i]);
-        if (a && b) {
-          total += distanceMeters(a.lat, a.lon, b.lat, b.lon);
-        }
-      }
-      return total;
-    }
-
-    function setRouteInternal(start, end) {
-      if (!graph.nodes.size) {
-        throw new Error('路网未构建');
-      }
-      const s = findNearestNode(start.lat, start.lon);
-      const t = findNearestNode(end.lat, end.lon);
-      if (!s.id || !t.id) {
-        throw new Error('未找到可用节点');
-      }
-      const pathIds = shortestPath(s.id, t.id);
-      if (!pathIds || pathIds.length < 2) {
-        throw new Error('未找到可达路线');
-      }
-      routePolyline = buildPolylineFromNodes(pathIds);
-      if (!routePolyline.length || routePolyline.length < 2) {
-        throw new Error('路线绘制失败');
-      }
-      const distance = calcRouteDistance(pathIds);
-      const speed = 1.4; // m/s walking speed
-      const eta = distance / speed;
-      routeInfo = { distance, eta, startNode: s.id, endNode: t.id };
-      setBadge(`路线 ${Math.round(distance)} 米 · 约 ${Math.round(eta / 60)} 分钟`);
       draw();
     }
-
-    window.setRoute = (payload) => {
-      try {
-        const start = payload?.start;
-        const end = payload?.end;
-        if (!start || !end || typeof start.lat !== 'number' || typeof start.lon !== 'number' || typeof end.lat !== 'number' || typeof end.lon !== 'number') {
-          throw new Error('起终点坐标无效');
-        }
-        setRouteInternal(start, end);
-        return { ok: true, info: routeInfo };
-      } catch (error) {
-        routePolyline = [];
-        routeInfo = null;
-        const message = error && error.message ? error.message : '未知错误';
-        setBadge(`导航失败 · ${message}`);
-        draw();
-        return { ok: false, error: message };
-      }
-    };
-
-    window.clearRoute = () => {
-      routePolyline = [];
-      routeInfo = null;
-      setBadge('自定义地图 · 支持拖动与双指缩放');
-      draw();
-    };
-
-    window.onerror = (message) => {
-      try {
-        setBadge(`导航失败 · ${String(message)}`);
-      } catch (err) {
-        // ignore
-      }
-      return false;
-    };
 
     function onPointerDown(x, y) {
       state.dragging = true;
@@ -1077,6 +1302,33 @@
       themeToggle.addEventListener('click', () => {
         const nextTheme = currentTheme === 'day' ? 'night' : 'day';
         setTheme(nextTheme);
+      });
+      // Also handle touch and keyboard to improve reliability on mobile/embedded WebView
+      themeToggle.addEventListener('touchstart', (e) => {
+        // prevent default so the synthetic click is not delayed or suppressed
+        e.preventDefault();
+        const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+        setTheme(nextTheme);
+      }, { passive: false });
+
+      themeToggle.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+          setTheme(nextTheme);
+        }
+      });
+    }
+
+    if (poiSearch) {
+      poiSearch.addEventListener('input', updatePoiSelects);
+    }
+    if (planRouteBtn) {
+      planRouteBtn.addEventListener('click', setRouteFromSelection);
+    }
+    if (clearRouteBtn) {
+      clearRouteBtn.addEventListener('click', () => {
+        window.clearRoute && window.clearRoute();
       });
     }
 
