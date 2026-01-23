@@ -1,26 +1,56 @@
 import web_webview from '@ohos.web.webview';
-import util from '@ohos.util';
+import common from '@ohos.app.ability.common';
 
 @Entry
 @Component
 struct Index {
   private webController: web_webview.WebviewController = new web_webview.WebviewController();
-  private osmInjected: boolean = false;
+  private hasInjectedOsm: boolean = false;
+  private utf8ArrayToStr(array: Uint8Array): string {
+    let out = '';
+    let i = 0;
+    while (i < array.length) {
+      const c = array[i++];
+      if (c < 0x80) {
+        out += String.fromCharCode(c);
+      } else if (c >= 0xC0 && c < 0xE0) {
+        const c2 = array[i++];
+        out += String.fromCharCode(((c & 0x1F) << 6) | (c2 & 0x3F));
+      } else if (c >= 0xE0 && c < 0xF0) {
+        const c2 = array[i++];
+        const c3 = array[i++];
+        out += String.fromCharCode(((c & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F));
+      } else {
+        const c2 = array[i++];
+        const c3 = array[i++];
+        const c4 = array[i++];
+        let codepoint = ((c & 0x07) << 18) | ((c2 & 0x3F) << 12) | ((c3 & 0x3F) << 6) | (c4 & 0x3F);
+        codepoint -= 0x10000;
+        out += String.fromCharCode((codepoint >> 10) + 0xD800);
+        out += String.fromCharCode((codepoint & 0x3FF) + 0xDC00);
+      }
+    }
+    return out;
+  }
 
   private async injectOsmToWeb(): Promise<void> {
-    if (this.osmInjected) {
+    if (this.hasInjectedOsm) {
       return;
     }
     try {
-      const context = getContext(this);
-      const buffer = await context.resourceManager.getRawFileContent('map.osm');
-      const decoder = new util.TextDecoder('utf-8');
-      const osmText = decoder.decode(buffer);
-      const script = `window.setOSMText && window.setOSMText(${JSON.stringify(osmText)});`;
-      this.webController.runJavaScript(script);
-      this.osmInjected = true;
+      const context = getContext(this) as common.UIAbilityContext;
+      const rawContent = await context.resourceManager.getRawFileContent('map.osm');
+      const uint8 = rawContent instanceof Uint8Array ? rawContent : new Uint8Array(rawContent);
+      // Proper UTF-8 decode to handle multibyte characters (Chinese, etc.).
+      const osmText = this.utf8ArrayToStr(uint8);
+      const payload = JSON.stringify(osmText);
+      const jsCode = `window.__PENDING_OSM_TEXT=${payload};` +
+        `if (window.setOSMText) { window.setOSMText(window.__PENDING_OSM_TEXT); }`;
+      await this.webController.runJavaScript(jsCode);
+      this.hasInjectedOsm = true;
+      console.info('OSM 注入成功');
     } catch (error) {
-      this.osmInjected = false;
+      console.error(`OSM 注入失败: ${String(error)}`);
     }
   }
 

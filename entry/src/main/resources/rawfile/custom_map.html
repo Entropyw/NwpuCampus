@@ -11,8 +11,8 @@
       width: 100%;
       height: 100%;
       overflow: hidden;
-      background: #f5f7fb;
-      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f7f5f2;
+      font-family: "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif;
     }
     #map {
       display: block;
@@ -25,27 +25,119 @@
       left: 50%;
       top: 16px;
       transform: translateX(-50%);
-  background: rgba(255, 255, 255, 0.85);
-  color: #1f2a44;
+      background: rgba(255, 255, 255, 0.88);
+      color: #27324a;
       padding: 8px 14px;
       border-radius: 18px;
       font-size: 13px;
       letter-spacing: 0.4px;
+      box-shadow: 0 6px 16px rgba(27, 38, 56, 0.12);
       pointer-events: none;
+    }
+    .controls {
+      position: absolute;
+      right: 16px;
+      bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 10;
+    }
+    .control-btn {
+      width: 44px;
+      height: 44px;
+      border: none;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.92);
+      color: #2b3347;
+      font-size: 20px;
+      font-weight: 600;
+      box-shadow: 0 8px 18px rgba(22, 34, 51, 0.18);
+      cursor: pointer;
+    }
+    .control-btn:active {
+      transform: scale(0.96);
+    }
+    .theme-toggle {
+      font-size: 12px;
+      padding: 0 8px;
+      width: 72px;
+      height: 36px;
+      border-radius: 18px;
     }
   </style>
 </head>
 <body>
   <canvas id="map"></canvas>
   <div class="badge">自定义地图 · 支持拖动与双指缩放</div>
+  <div class="controls">
+    <button class="control-btn" id="zoomIn">+</button>
+    <button class="control-btn" id="zoomOut">−</button>
+    <button class="control-btn theme-toggle" id="themeToggle">日间</button>
+  </div>
 
   <script>
     const canvas = document.getElementById('map');
     const ctx = canvas.getContext('2d');
     const badge = document.querySelector('.badge');
+    const zoomInButton = document.getElementById('zoomIn');
+    const zoomOutButton = document.getElementById('zoomOut');
+    const themeToggle = document.getElementById('themeToggle');
+    const THEMES = {
+      day: {
+        background: '#f7f5f2',
+        water: '#b9d9f5',
+        park: '#cfe8c6',
+        pitchFill: '#8fd9c2',
+        pitchAccent: '#f1b27a',
+        buildingFill: '#efe8dd',
+        buildingStroke: '#d7cbbf',
+        mapBase: '#f7f5f2',
+        label: '#263042',
+        labelHalo: 'rgba(255, 255, 255, 0.92)',
+        poi: '#2f7df6',
+        road: {
+          motorway: { width: 5.2, color: '#f5c48b', casing: '#d9b07a' },
+          trunk: { width: 4.8, color: '#f3d6a4', casing: '#d2b489' },
+          primary: { width: 4.4, color: '#f4e0bd', casing: '#d7c8a7' },
+          secondary: { width: 3.6, color: '#ffffff', casing: '#d7cbbf' },
+          tertiary: { width: 3.1, color: '#ffffff', casing: '#d7cbbf' },
+          residential: { width: 2.6, color: '#ffffff', casing: '#dcd3c7' },
+          service: { width: 2.1, color: '#ffffff', casing: '#e4ddd3' },
+          footway: { width: 1.5, color: '#f1f7ee', casing: '#b9d3b0' },
+          path: { width: 1.2, color: '#f1f7ee', casing: '#b9d3b0' }
+        }
+      },
+      night: {
+        background: '#1d2230',
+        water: '#27435e',
+        park: '#1e3a2f',
+        pitchFill: '#1f5a4d',
+        pitchAccent: '#c58a5e',
+        buildingFill: '#2b3246',
+        buildingStroke: '#404a62',
+        mapBase: '#1d2230',
+        label: '#e5ecff',
+        labelHalo: 'rgba(20, 24, 33, 0.85)',
+        poi: '#6ea8ff',
+        road: {
+          motorway: { width: 5.2, color: '#c18b4b', casing: '#7d5c35' },
+          trunk: { width: 4.8, color: '#b69063', casing: '#6e5639' },
+          primary: { width: 4.4, color: '#a98257', casing: '#66503a' },
+          secondary: { width: 3.6, color: '#6e7488', casing: '#4b5164' },
+          tertiary: { width: 3.1, color: '#6e7488', casing: '#4b5164' },
+          residential: { width: 2.6, color: '#717991', casing: '#4b5164' },
+          service: { width: 2.1, color: '#717991', casing: '#4b5164' },
+          footway: { width: 1.5, color: '#5a6b61', casing: '#3f5147' },
+          path: { width: 1.2, color: '#5a6b61', casing: '#3f5147' }
+        }
+      }
+    };
+    let currentTheme = 'day';
 
     const state = {
-      scale: 1,
+  scale: 1,
+  dpr: window.devicePixelRatio || 1,
       minScale: 0.5,
       maxScale: 5,
       offsetX: 0,
@@ -79,10 +171,11 @@
     let loadError = null;
 
     function resize() {
-      canvas.width = window.innerWidth * devicePixelRatio;
-      canvas.height = window.innerHeight * devicePixelRatio;
+      state.dpr = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * state.dpr;
+      canvas.height = window.innerHeight * state.dpr;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.scale(devicePixelRatio, devicePixelRatio);
+      ctx.scale(state.dpr, state.dpr);
       if (dataReady) {
         fitToView();
       }
@@ -300,7 +393,8 @@
     }
 
     function drawAreas() {
-      ctx.fillStyle = '#c7efc0';
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.park;
       for (const area of renderData.areas) {
         drawPath(area.points, true);
         ctx.fill();
@@ -308,7 +402,8 @@
     }
 
     function drawWaters() {
-      ctx.fillStyle = '#b7d8ff';
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.water;
       for (const water of renderData.waters) {
         drawPath(water.points, true);
         ctx.fill();
@@ -316,27 +411,29 @@
     }
 
     function drawPitches() {
-      ctx.fillStyle = '#7fd6c2';
-      ctx.strokeStyle = '#f2b184';
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.pitchFill;
+      ctx.strokeStyle = theme.pitchAccent;
       ctx.lineWidth = 6 / state.scale;
       for (const pitch of renderData.pitches) {
         drawPath(pitch.points, true);
         ctx.fill();
         ctx.stroke();
 
-        ctx.strokeStyle = '#ffffff';
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
         ctx.lineWidth = 2 / state.scale;
         ctx.stroke();
 
-        ctx.strokeStyle = '#f6d5b2';
+        ctx.strokeStyle = theme.pitchAccent;
         ctx.lineWidth = 3.5 / state.scale;
         ctx.stroke();
       }
     }
 
     function drawBuildings() {
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#cbd5e1';
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.buildingFill;
+      ctx.strokeStyle = theme.buildingStroke;
       ctx.lineWidth = 1 / state.scale;
       for (const building of renderData.buildings) {
         drawPath(building.points, true);
@@ -346,17 +443,8 @@
     }
 
     function drawRoads() {
-      const roadStyles = {
-        motorway: { width: 6, color: '#ffd18a', casing: '#e0b064' },
-        trunk: { width: 5.5, color: '#ffe0a6', casing: '#d6b06f' },
-        primary: { width: 5, color: '#ffe8bf', casing: '#d7c19a' },
-        secondary: { width: 4.2, color: '#ffffff', casing: '#cbd5e1' },
-        tertiary: { width: 3.6, color: '#ffffff', casing: '#cbd5e1' },
-        residential: { width: 3, color: '#ffffff', casing: '#d3dbe4' },
-        service: { width: 2.4, color: '#ffffff', casing: '#dbe3ea' },
-        footway: { width: 1.6, color: '#f3f9f0', casing: '#b6d4b0' },
-        path: { width: 1.2, color: '#f3f9f0', casing: '#b6d4b0' }
-      };
+      const theme = THEMES[currentTheme];
+      const roadStyles = theme.road;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       for (const road of renderData.roads) {
@@ -377,11 +465,12 @@
       if (!showAutoLabels || state.scale < 0.7) {
         return;
       }
-      const fontSize = Math.max(10, 12 / state.scale);
-      ctx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`;
-      ctx.fillStyle = '#1f2a44';
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
-      ctx.lineWidth = 3 / state.scale;
+  const theme = THEMES[currentTheme];
+  const fontSize = Math.max(11, 13 / state.scale);
+  ctx.font = `${fontSize}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
+  ctx.fillStyle = theme.label;
+  ctx.strokeStyle = theme.labelHalo;
+  ctx.lineWidth = 3 / state.scale;
       const gridSize = 90 / state.scale;
       const occupied = new Set();
       const sortedLabels = [...renderData.labels].sort((a, b) => (b.priority || 0) - (a.priority || 0));
@@ -399,15 +488,15 @@
           const markerX = label.position.x;
           const markerY = label.position.y;
           const radius = 5 / state.scale;
-          ctx.fillStyle = '#2f7df6';
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+          ctx.fillStyle = theme.poi;
+          ctx.strokeStyle = theme.labelHalo;
           ctx.lineWidth = 2 / state.scale;
           ctx.beginPath();
           ctx.arc(markerX, markerY, radius, 0, Math.PI * 2);
           ctx.fill();
           ctx.stroke();
-          ctx.fillStyle = '#1f2a44';
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+          ctx.fillStyle = theme.label;
+          ctx.strokeStyle = theme.labelHalo;
           ctx.lineWidth = 3 / state.scale;
         }
         ctx.strokeText(label.name, textX, textY);
@@ -419,7 +508,8 @@
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.save();
       ctx.setTransform(state.scale, 0, 0, state.scale, state.offsetX, state.offsetY);
-      ctx.fillStyle = '#dfefff';
+  const theme = THEMES[currentTheme];
+  ctx.fillStyle = theme.mapBase;
       ctx.fillRect(0, 0, mapWidth, mapHeight);
       if (dataReady) {
         drawAreas();
@@ -430,8 +520,8 @@
         drawLabels();
         drawCustomMarkers();
       } else {
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = `bold ${28 / state.scale}px "PingFang SC", "Microsoft YaHei", sans-serif`;
+        ctx.fillStyle = theme.poi;
+        ctx.font = `bold ${28 / state.scale}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
         const message = loadError ? 'OSM 加载失败' : '正在加载 OSM 数据…';
         ctx.fillText(message, 40, 80);
       }
@@ -505,7 +595,16 @@
       } catch (error) {
         loadError = error;
         const message = error && error.message ? error.message : '未知错误';
-        setBadge(`OSM 加载失败 · ${message}`);
+        setBadge(`OSM 加载失败 · ${message} · 等待注入`);
+        if (window.__PENDING_OSM_TEXT) {
+          window.setOSMText(window.__PENDING_OSM_TEXT);
+        } else {
+          setTimeout(() => {
+            if (!dataReady && window.__PENDING_OSM_TEXT) {
+              window.setOSMText(window.__PENDING_OSM_TEXT);
+            }
+          }, 300);
+        }
       }
       draw();
     }
@@ -525,15 +624,20 @@
       draw();
     };
 
+    if (window.__PENDING_OSM_TEXT) {
+      window.setOSMText(window.__PENDING_OSM_TEXT);
+    }
+
     function drawCustomMarkers() {
       if (!customMarkers.length) {
         return;
       }
-      ctx.fillStyle = '#2563eb';
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.poi;
+      ctx.strokeStyle = theme.labelHalo;
       ctx.lineWidth = 2 / state.scale;
-      ctx.font = `${Math.max(10, 12 / state.scale)}px "PingFang SC", "Microsoft YaHei", sans-serif`;
-      ctx.fillStyle = '#2563eb';
+      ctx.font = `${Math.max(10, 12 / state.scale)}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
+      ctx.fillStyle = theme.poi;
       for (const marker of customMarkers) {
         const point = project(marker.lat, marker.lon);
         const radius = 6 / state.scale;
@@ -582,6 +686,15 @@
       showAutoLabels = Boolean(enabled);
       draw();
     };
+
+    function setTheme(nextTheme) {
+      currentTheme = nextTheme in THEMES ? nextTheme : 'day';
+      document.body.style.background = THEMES[currentTheme].background;
+      if (themeToggle) {
+        themeToggle.textContent = currentTheme === 'day' ? '日间' : '夜间';
+      }
+      draw();
+    }
 
     function onPointerDown(x, y) {
       state.dragging = true;
@@ -658,9 +771,31 @@
       onPointerUp();
     });
 
+    if (zoomInButton) {
+      zoomInButton.addEventListener('click', () => {
+        zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale + 0.2);
+        draw();
+      });
+    }
+
+    if (zoomOutButton) {
+      zoomOutButton.addEventListener('click', () => {
+        zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale - 0.2);
+        draw();
+      });
+    }
+
+    if (themeToggle) {
+      themeToggle.addEventListener('click', () => {
+        const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+        setTheme(nextTheme);
+      });
+    }
+
     window.addEventListener('resize', resize);
 
     resize();
+  setTheme(currentTheme);
     loadOSM();
   </script>
 </body>
