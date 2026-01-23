@@ -1,5 +1,5 @@
 import web_webview from '@ohos.web.webview';
-import util from '@ohos.util';
+import common from '@ohos.app.ability.common';
 
 interface POI {
   name: string;
@@ -43,7 +43,7 @@ struct Index {
   ];
 
   private async injectOsmToWeb(): Promise<void> {
-    if (this.osmInjected) {
+    if (this.hasInjectedOsm) {
       return;
     }
     try {
@@ -56,7 +56,7 @@ struct Index {
       this.osmInjected = true;
       this.updateMarkers();
     } catch (error) {
-      this.osmInjected = false;
+      console.error(`OSM 注入失败: ${String(error)}`);
     }
   }
 
