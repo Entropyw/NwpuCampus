@@ -1,0 +1,16 @@
+{
+  "users": [
+    {
+      "id": "admin",
+      "username": "admin",
+      "password": "admin123",
+      "isAdmin": true,
+      "hiddenPlaceIds": [],
+      "createdAt": 0
+    }
+  ],
+  "places": [],
+  "feedback": [],
+  "tokens": {},
+  "systemOverrides": []
+}
