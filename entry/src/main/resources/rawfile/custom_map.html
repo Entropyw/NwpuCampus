@@ -1,0 +1,1342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>自定义地图</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f7f5f2;
+      font-family: "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif;
+    }
+    #map {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+    .badge {
+      display: none;
+    }
+    .controls {
+      position: absolute;
+      right: 16px;
+      bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 1000; /* ensure controls sit above canvas and other layers */
+      pointer-events: auto; /* explicitly allow pointer events */
+    }
+    .control-btn {
+      width: 44px;
+      height: 44px;
+      border: none;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.92);
+      color: #2b3347;
+      font-size: 20px;
+      font-weight: 600;
+      box-shadow: 0 8px 18px rgba(22, 34, 51, 0.18);
+      cursor: pointer;
+    }
+    .control-btn:active {
+      transform: scale(0.96);
+    }
+    .theme-toggle {
+      font-size: 12px;
+      padding: 0 8px;
+      width: 72px;
+      height: 36px;
+      border-radius: 18px;
+    }
+    .poi-panel {
+      position: absolute;
+      left: 16px;
+      top: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: rgba(28, 33, 45, 0.72);
+      color: #fff;
+      padding: 12px;
+      border-radius: 12px;
+      box-shadow: 0 8px 18px rgba(22, 34, 51, 0.18);
+      z-index: 1000;
+      width: 220px;
+      font-size: 12px;
+    }
+    .poi-panel label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .poi-panel input,
+    .poi-panel select {
+      height: 32px;
+      border-radius: 8px;
+      border: none;
+      padding: 0 10px;
+      font-size: 12px;
+    }
+    .poi-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .poi-actions button {
+      flex: 1;
+      height: 32px;
+      border: none;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.92);
+      color: #2b3347;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="map"></canvas>
+  <div class="badge">自定义地图 · 支持拖动与双指缩放</div>
+  <div class="poi-panel">
+    <label>
+      搜索 POI
+      <input id="poiSearch" type="text" placeholder="输入地点名称" />
+    </label>
+    <label>
+      起点
+      <select id="startSelect"></select>
+    </label>
+    <label>
+      终点
+      <select id="endSelect"></select>
+    </label>
+    <div class="poi-actions">
+      <button id="planRouteBtn">规划路线</button>
+      <button id="clearRouteBtn">清除</button>
+    </div>
+  </div>
+  <div class="controls">
+    <button class="control-btn" id="zoomIn">+</button>
+    <button class="control-btn" id="zoomOut">−</button>
+    <button class="control-btn theme-toggle" id="themeToggle">日间</button>
+  </div>
+  <!-- Visible overlay to show uncaught JS errors inside the WebView (helpful for debugging crashes) -->
+  <div id="errorOverlay" style="display:none; position: absolute; left: 16px; right:16px; top: 50%; transform: translateY(-50%); background: rgba(200,20,20,0.95); color: #fff; padding: 12px; border-radius: 8px; z-index:2000; font-size:14px; white-space: pre-wrap; max-height:60%; overflow:auto;"></div>
+
+  <script>
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+    const errorOverlay = document.getElementById('errorOverlay');
+
+    function showErrorOverlay(msg) {
+      try {
+        if (errorOverlay) {
+          errorOverlay.style.display = 'block';
+          errorOverlay.textContent = String(msg);
+        }
+        if (typeof console !== 'undefined' && console.error) {
+          console.error('WebView uncaught error:', msg);
+        }
+        // also set a visible badge for quick attention
+        try { setBadge && setBadge('脚本异常，查看日志'); } catch (e) {}
+      } catch (e) {
+        // swallow
+      }
+    }
+
+    window.addEventListener('error', function (ev) {
+      const msg = ev && ev.message ? ev.message + '\n' + (ev.filename || '') + ':' + (ev.lineno || '') : String(ev);
+      showErrorOverlay(msg);
+    });
+
+    window.addEventListener('unhandledrejection', function (ev) {
+      const reason = ev && ev.reason ? ev.reason : ev;
+      showErrorOverlay('UnhandledRejection: ' + (reason && reason.message ? reason.message : String(reason)));
+    });
+  const badge = document.querySelector('.badge');
+  const poiSearch = document.getElementById('poiSearch');
+  const startSelect = document.getElementById('startSelect');
+  const endSelect = document.getElementById('endSelect');
+  const planRouteBtn = document.getElementById('planRouteBtn');
+  const clearRouteBtn = document.getElementById('clearRouteBtn');
+    const zoomInButton = document.getElementById('zoomIn');
+    const zoomOutButton = document.getElementById('zoomOut');
+    const themeToggle = document.getElementById('themeToggle');
+    const THEMES = {
+      day: {
+        background: '#f7f5f2',
+        water: '#b9d9f5',
+        park: '#cfe8c6',
+        pitchFill: '#8fd9c2',
+        pitchAccent: '#f1b27a',
+        buildingFill: '#efe8dd',
+        buildingStroke: '#d7cbbf',
+        mapBase: '#f7f5f2',
+        label: '#263042',
+        labelHalo: 'rgba(255, 255, 255, 0.92)',
+        poi: '#2f7df6',
+  route: '#1866ff',
+        road: {
+          motorway: { width: 5.2, color: '#f5c48b', casing: '#d9b07a' },
+          trunk: { width: 4.8, color: '#f3d6a4', casing: '#d2b489' },
+          primary: { width: 4.4, color: '#f4e0bd', casing: '#d7c8a7' },
+          secondary: { width: 3.6, color: '#ffffff', casing: '#d7cbbf' },
+          tertiary: { width: 3.1, color: '#ffffff', casing: '#d7cbbf' },
+          residential: { width: 2.6, color: '#ffffff', casing: '#dcd3c7' },
+          service: { width: 2.1, color: '#ffffff', casing: '#e4ddd3' },
+          footway: { width: 1.5, color: '#f1f7ee', casing: '#b9d3b0' },
+          path: { width: 1.2, color: '#f1f7ee', casing: '#b9d3b0' }
+        }
+      },
+      night: {
+        background: '#1d2230',
+        water: '#27435e',
+        park: '#1e3a2f',
+        pitchFill: '#1f5a4d',
+        pitchAccent: '#c58a5e',
+        buildingFill: '#2b3246',
+        buildingStroke: '#404a62',
+        mapBase: '#1d2230',
+        label: '#e5ecff',
+        labelHalo: 'rgba(20, 24, 33, 0.85)',
+        poi: '#6ea8ff',
+        // brighter yellow for night routes
+        route: '#ffd54f',
+        road: {
+          motorway: { width: 5.2, color: '#c18b4b', casing: '#7d5c35' },
+          trunk: { width: 4.8, color: '#b69063', casing: '#6e5639' },
+          primary: { width: 4.4, color: '#a98257', casing: '#66503a' },
+          secondary: { width: 3.6, color: '#6e7488', casing: '#4b5164' },
+          tertiary: { width: 3.1, color: '#6e7488', casing: '#4b5164' },
+          residential: { width: 2.6, color: '#717991', casing: '#4b5164' },
+          service: { width: 2.1, color: '#717991', casing: '#4b5164' },
+          footway: { width: 1.5, color: '#5a6b61', casing: '#3f5147' },
+          path: { width: 1.2, color: '#5a6b61', casing: '#3f5147' }
+        }
+      }
+    };
+    let currentTheme = 'day';
+
+    const state = {
+  scale: 1,
+  dpr: window.devicePixelRatio || 1,
+      minScale: 0.5,
+      maxScale: 5,
+      offsetX: 0,
+      offsetY: 0,
+      dragging: false,
+      lastX: 0,
+      lastY: 0,
+      pinchStartDist: 0,
+      pinchStartScale: 1
+    };
+
+    const OSM_URLS = [
+      'map.osm',
+      './map.osm',
+      'resource://rawfile/map.osm'
+    ];
+    const renderData = {
+      bounds: null,
+      roads: [],
+      buildings: [],
+      areas: [],
+      waters: [],
+      pitches: [],
+      labels: []
+    };
+  const customMarkers = [];
+  let currentRoute = null;
+  let routePath = [];
+  let labelPoiList = [];
+  let roadGraph = { nodes: [], adj: [] };
+  let currentAnimationToken = 0;
+  let pendingRouteTimer = null;
+    let showAutoLabels = true;
+    let mapWidth = 2000;
+    let mapHeight = 2000;
+    let dataReady = false;
+    let loadError = null;
+
+    function resize() {
+      state.dpr = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * state.dpr;
+      canvas.height = window.innerHeight * state.dpr;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(state.dpr, state.dpr);
+      if (dataReady) {
+        fitToView();
+      }
+      draw();
+    }
+
+    function clampScale(scale) {
+      return Math.min(state.maxScale, Math.max(state.minScale, scale));
+    }
+
+    function zoomAt(clientX, clientY, newScale) {
+      const scale = state.scale;
+      const worldX = (clientX - state.offsetX) / scale;
+      const worldY = (clientY - state.offsetY) / scale;
+      state.scale = clampScale(newScale);
+      state.offsetX = clientX - worldX * state.scale;
+      state.offsetY = clientY - worldY * state.scale;
+    }
+
+    function setBadge(text) {
+      if (badge) {
+        badge.textContent = text;
+      }
+    }
+
+    function parseTags(element) {
+      const tags = {};
+      const tagNodes = element.getElementsByTagName('tag');
+      for (const tag of tagNodes) {
+        const key = tag.getAttribute('k');
+        const value = tag.getAttribute('v');
+        if (key && value) {
+          tags[key] = value;
+        }
+      }
+      return tags;
+    }
+
+    function parseBounds(xmlDoc) {
+      const boundsEl = xmlDoc.querySelector('bounds');
+      if (!boundsEl) {
+        return null;
+      }
+      const minLat = Number(boundsEl.getAttribute('minlat'));
+      const minLon = Number(boundsEl.getAttribute('minlon'));
+      const maxLat = Number(boundsEl.getAttribute('maxlat'));
+      const maxLon = Number(boundsEl.getAttribute('maxlon'));
+      if ([minLat, minLon, maxLat, maxLon].some((value) => Number.isNaN(value))) {
+        return null;
+      }
+      return { minLat, minLon, maxLat, maxLon };
+    }
+
+    function computeMapSize(bounds) {
+      const lonSpan = bounds.maxLon - bounds.minLon;
+      const latSpan = bounds.maxLat - bounds.minLat;
+      mapWidth = 2000;
+      mapHeight = mapWidth * (latSpan / lonSpan);
+    }
+
+    function getCentroid(points) {
+      let sumX = 0;
+      let sumY = 0;
+      for (const point of points) {
+        sumX += point.x;
+        sumY += point.y;
+      }
+      return {
+        x: sumX / points.length,
+        y: sumY / points.length
+      };
+    }
+
+    function project(lat, lon) {
+      const bounds = renderData.bounds;
+      const lonSpan = bounds.maxLon - bounds.minLon;
+      const latSpan = bounds.maxLat - bounds.minLat;
+      const x = ((lon - bounds.minLon) / lonSpan) * mapWidth;
+      const y = ((bounds.maxLat - lat) / latSpan) * mapHeight;
+      return { x, y };
+    }
+
+    function buildRenderData(xmlDoc) {
+      renderData.roads = [];
+      renderData.buildings = [];
+      renderData.areas = [];
+      renderData.waters = [];
+  renderData.pitches = [];
+      renderData.labels = [];
+
+      const nodes = new Map();
+      const nodeElements = xmlDoc.getElementsByTagName('node');
+      for (const node of nodeElements) {
+        const id = node.getAttribute('id');
+        const lat = Number(node.getAttribute('lat'));
+        const lon = Number(node.getAttribute('lon'));
+        if (!id || Number.isNaN(lat) || Number.isNaN(lon)) {
+          continue;
+        }
+        const tags = parseTags(node);
+        nodes.set(id, { lat, lon, tags });
+
+        const name = tags.name;
+        const isLabel = Boolean(name && (tags.amenity || tags.shop || tags.tourism || tags.barrier || tags.man_made || tags.building));
+        if (isLabel) {
+          renderData.labels.push({
+            name,
+            position: project(lat, lon),
+            priority: tags.amenity || tags.shop || tags.tourism ? 3 : 2
+          });
+        }
+      }
+
+      const wayElements = xmlDoc.getElementsByTagName('way');
+      for (const way of wayElements) {
+        const tags = parseTags(way);
+        const nodeRefs = way.getElementsByTagName('nd');
+        const points = [];
+        for (const ref of nodeRefs) {
+          const nodeId = ref.getAttribute('ref');
+          const node = nodeId ? nodes.get(nodeId) : null;
+          if (!node) {
+            continue;
+          }
+          points.push(project(node.lat, node.lon));
+        }
+        if (points.length < 2) {
+          continue;
+        }
+
+        if (tags.building) {
+          renderData.buildings.push({ points, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.leisure === 'pitch' || tags.sport) {
+          renderData.pitches.push({ points, sport: tags.sport || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.highway) {
+          renderData.roads.push({ points, type: tags.highway, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 1
+            });
+          }
+          continue;
+        }
+
+        if (tags.natural === 'water' || tags.landuse === 'reservoir' || tags.waterway) {
+          renderData.waters.push({ points, name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 2
+            });
+          }
+          continue;
+        }
+
+        if (tags.leisure === 'park' || tags.landuse === 'grass' || tags.landuse === 'meadow' || tags.landuse === 'forest') {
+          renderData.areas.push({ points, type: tags.leisure || tags.landuse || '', name: tags.name || '' });
+          if (tags.name) {
+            renderData.labels.push({
+              name: tags.name,
+              position: getCentroid(points),
+              priority: 1
+            });
+          }
+        }
+      }
+      buildRoadGraph();
+      // rebuild label POI list to align with actual rendered labels
+      labelPoiList = renderData.labels.map((label) => ({
+        name: label.name,
+        position: label.position
+      }));
+      // de-duplicate by name
+      const seen = new Set();
+      labelPoiList = labelPoiList.filter((item) => {
+        if (seen.has(item.name)) return false;
+        seen.add(item.name);
+        return true;
+      });
+      updatePoiSelects();
+    }
+
+    function buildRoadGraph() {
+      const nodes = [];
+      const adj = [];
+      const keyMap = new Map();
+
+      const keyFor = (p) => {
+        const rx = Math.round(p.x * 2) / 2;
+        const ry = Math.round(p.y * 2) / 2;
+        return `${rx},${ry}`;
+      };
+
+      const addNode = (p) => {
+        const key = keyFor(p);
+        if (keyMap.has(key)) {
+          return keyMap.get(key);
+        }
+        const idx = nodes.length;
+        nodes.push({ x: p.x, y: p.y });
+        adj.push([]);
+        keyMap.set(key, idx);
+        return idx;
+      };
+
+      const addEdge = (aIdx, bIdx, w) => {
+        adj[aIdx].push({ to: bIdx, w });
+        adj[bIdx].push({ to: aIdx, w });
+      };
+
+      for (const road of renderData.roads) {
+        const pts = road.points;
+        for (let i = 1; i < pts.length; i++) {
+          const a = pts[i - 1];
+          const b = pts[i];
+          const aIdx = addNode(a);
+          const bIdx = addNode(b);
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          const dist = Math.hypot(dx, dy);
+          addEdge(aIdx, bIdx, dist);
+        }
+      }
+
+      roadGraph = { nodes, adj };
+    }
+
+    function fitToView() {
+      const viewportWidth = canvas.width / devicePixelRatio;
+      const viewportHeight = canvas.height / devicePixelRatio;
+      const padding = 24;
+      const scaleX = (viewportWidth - padding * 2) / mapWidth;
+      const scaleY = (viewportHeight - padding * 2) / mapHeight;
+      const nextScale = clampScale(Math.min(scaleX, scaleY));
+      state.scale = nextScale;
+      state.minScale = nextScale * 0.4;
+      state.maxScale = nextScale * 10;
+      state.offsetX = (viewportWidth - mapWidth * nextScale) / 2;
+      state.offsetY = (viewportHeight - mapHeight * nextScale) / 2;
+    }
+
+    function drawPath(points, closePath = false) {
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      if (closePath) {
+        ctx.closePath();
+      }
+    }
+
+    function drawAreas() {
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.park;
+      for (const area of renderData.areas) {
+        drawPath(area.points, true);
+        ctx.fill();
+      }
+    }
+
+    function drawWaters() {
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.water;
+      for (const water of renderData.waters) {
+        drawPath(water.points, true);
+        ctx.fill();
+      }
+    }
+
+    function drawPitches() {
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.pitchFill;
+      ctx.strokeStyle = theme.pitchAccent;
+      ctx.lineWidth = 6 / state.scale;
+      for (const pitch of renderData.pitches) {
+        drawPath(pitch.points, true);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+        ctx.lineWidth = 2 / state.scale;
+        ctx.stroke();
+
+        ctx.strokeStyle = theme.pitchAccent;
+        ctx.lineWidth = 3.5 / state.scale;
+        ctx.stroke();
+      }
+    }
+
+    function drawBuildings() {
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.buildingFill;
+      ctx.strokeStyle = theme.buildingStroke;
+      ctx.lineWidth = 1 / state.scale;
+      for (const building of renderData.buildings) {
+        drawPath(building.points, true);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    function drawRoads() {
+      const theme = THEMES[currentTheme];
+      const roadStyles = theme.road;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (const road of renderData.roads) {
+        const style = roadStyles[road.type] || { width: 2.2, color: '#ffffff', casing: '#d3dbe4' };
+        ctx.strokeStyle = style.casing;
+        ctx.lineWidth = (style.width + 1.6) / state.scale;
+        drawPath(road.points, false);
+        ctx.stroke();
+
+        ctx.strokeStyle = style.color;
+        ctx.lineWidth = style.width / state.scale;
+        drawPath(road.points, false);
+        ctx.stroke();
+      }
+    }
+
+    function drawLabels() {
+      if (!showAutoLabels || state.scale < 0.7) {
+        return;
+      }
+  const theme = THEMES[currentTheme];
+  const fontSize = Math.max(11, 13 / state.scale);
+  ctx.font = `${fontSize}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
+  ctx.fillStyle = theme.label;
+  ctx.strokeStyle = theme.labelHalo;
+  ctx.lineWidth = 3 / state.scale;
+      const gridSize = 90 / state.scale;
+      const occupied = new Set();
+      const sortedLabels = [...renderData.labels].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+      for (const label of sortedLabels) {
+        const textX = label.position.x + 6 / state.scale;
+        const textY = label.position.y - 6 / state.scale;
+        const gridX = Math.floor(textX / gridSize);
+        const gridY = Math.floor(textY / gridSize);
+        const key = `${gridX}-${gridY}`;
+        if (occupied.has(key)) {
+          continue;
+        }
+        occupied.add(key);
+        if ((label.priority || 0) >= 3) {
+          const markerX = label.position.x;
+          const markerY = label.position.y;
+          const radius = 5 / state.scale;
+          ctx.fillStyle = theme.poi;
+          ctx.strokeStyle = theme.labelHalo;
+          ctx.lineWidth = 2 / state.scale;
+          ctx.beginPath();
+          ctx.arc(markerX, markerY, radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = theme.label;
+          ctx.strokeStyle = theme.labelHalo;
+          ctx.lineWidth = 3 / state.scale;
+        }
+        ctx.strokeText(label.name, textX, textY);
+        ctx.fillText(label.name, textX, textY);
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.setTransform(state.scale, 0, 0, state.scale, state.offsetX, state.offsetY);
+  const theme = THEMES[currentTheme];
+  ctx.fillStyle = theme.mapBase;
+      ctx.fillRect(0, 0, mapWidth, mapHeight);
+      if (dataReady) {
+        drawAreas();
+        drawWaters();
+        drawPitches();
+        drawBuildings();
+        drawRoads();
+        drawRoute();
+        drawLabels();
+        drawCustomMarkers();
+      } else {
+        ctx.fillStyle = theme.poi;
+        ctx.font = `bold ${28 / state.scale}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
+        const message = loadError ? 'OSM 加载失败' : '正在加载 OSM 数据…';
+        ctx.fillText(message, 40, 80);
+      }
+      ctx.restore();
+    }
+
+    function drawRoute() {
+      if (!routePath || routePath.length < 2) return;
+  const theme = THEMES[currentTheme];
+  ctx.strokeStyle = theme.route || theme.poi;
+      ctx.lineWidth = 4 / state.scale;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(routePath[0].x, routePath[0].y);
+      for (let i = 1; i < routePath.length; i++) {
+        ctx.lineTo(routePath[i].x, routePath[i].y);
+      }
+      ctx.stroke();
+    }
+
+    function nearestNodeIndex(point) {
+      if (!roadGraph || !roadGraph.nodes.length) return -1;
+      let bestIdx = -1;
+      let bestDist = Infinity;
+      for (let i = 0; i < roadGraph.nodes.length; i++) {
+        const n = roadGraph.nodes[i];
+        const dx = n.x - point.x;
+        const dy = n.y - point.y;
+        const d = dx * dx + dy * dy;
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      }
+      return bestIdx;
+    }
+
+    function focusOnRoute(pathPoints, preferZoomFactor = 1.4) {
+      if (!pathPoints || pathPoints.length === 0) return;
+      // compute bounding box of route points
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of pathPoints) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      // choose scale so the route fits comfortably
+      const viewportWidth = canvas.width / state.dpr;
+      const viewportHeight = canvas.height / state.dpr;
+      const padding = 80; // CSS px padding
+      const routeWidth = Math.max(1, maxX - minX);
+      const routeHeight = Math.max(1, maxY - minY);
+      const scaleX = (viewportWidth - padding * 2) / routeWidth;
+      const scaleY = (viewportHeight - padding * 2) / routeHeight;
+      let desiredScale = clampScale(Math.min(scaleX, scaleY) * preferZoomFactor);
+      // Prevent automatic zoom-out: if computed desiredScale is smaller than current
+      // scale we'll keep at least the current scale (so planning doesn't make the map shrink).
+      if (desiredScale < state.scale) {
+        desiredScale = clampScale(state.scale);
+      }
+      // animate zoom then center to computed center
+      animateZoomThenCenter({ x: centerX, y: centerY }, desiredScale, 420);
+    }
+
+    function dijkstra(startIdx, endIdx) {
+      // Dijkstra with iteration cap to avoid long blocking on large graphs.
+      const n = roadGraph.nodes.length;
+      const dist = new Array(n).fill(Infinity);
+      const prev = new Array(n).fill(-1);
+      const visited = new Array(n).fill(false);
+      dist[startIdx] = 0;
+      const maxIterations = Math.max(10000, n * 4); // safety cap
+      let iterations = 0;
+      for (let i = 0; i < n; i++) {
+        if (++iterations > maxIterations) {
+          console.warn('Dijkstra aborted after max iterations', iterations);
+          return null; // signal abort
+        }
+        let u = -1;
+        let best = Infinity;
+        for (let j = 0; j < n; j++) {
+          if (!visited[j] && dist[j] < best) {
+            best = dist[j];
+            u = j;
+          }
+        }
+        if (u === -1) break;
+        if (u === endIdx) break;
+        visited[u] = true;
+        const edges = roadGraph.adj[u];
+        for (const e of edges) {
+          const alt = dist[u] + e.w;
+          if (alt < dist[e.to]) {
+            dist[e.to] = alt;
+            prev[e.to] = u;
+          }
+        }
+      }
+      const path = [];
+      let cur = endIdx;
+      while (cur !== -1) {
+        path.push(roadGraph.nodes[cur]);
+        cur = prev[cur];
+      }
+      path.reverse();
+      return path;
+    }
+
+    function computeRoutePath(startPoint, endPoint) {
+      if (!roadGraph || !roadGraph.nodes.length) return [];
+      const startIdx = nearestNodeIndex(startPoint);
+      const endIdx = nearestNodeIndex(endPoint);
+      if (startIdx < 0 || endIdx < 0) return [];
+      const path = dijkstra(startIdx, endIdx);
+      if (!path || path.length === 0) {
+        // fallback to straight line if dijkstra aborted or produced no path
+        return [startPoint, endPoint];
+      }
+      return [startPoint, ...path, endPoint];
+    }
+
+    function focusOnPoint(pt, zoomFactor = 1.4) {
+      if (!pt) return;
+      const viewportWidth = canvas.width / state.dpr;
+      const viewportHeight = canvas.height / state.dpr;
+      const targetScale = clampScale(state.scale * zoomFactor);
+      const targetOffsetX = viewportWidth / 2 - pt.x * targetScale;
+      const targetOffsetY = viewportHeight / 2 - pt.y * targetScale;
+      // Smoothly animate: first zoom, then pan to center (avoids post-zoom shift)
+      animateZoomThenCenter(pt, targetScale, 350);
+    }
+
+    function animateZoomThenCenter(pt, targetScale, durationMs) {
+      const myToken = ++currentAnimationToken; // capture a unique token for this animation
+      const half = Math.max(20, durationMs / 2);
+      const startScale = state.scale;
+      const startOffsetX = state.offsetX;
+      const startOffsetY = state.offsetY;
+      const ease = function (t) { return 1 - Math.pow(1 - t, 3); }; // easeOutCubic
+
+      // Phase 1: animate scale only
+      const t0 = performance.now();
+      function stepScale(now) {
+        if (myToken !== currentAnimationToken) return; // cancelled
+        const t = Math.min(1, (now - t0) / half);
+        const eased = ease(t);
+        state.scale = startScale + (targetScale - startScale) * eased;
+        // keep offsets while zooming to avoid moving the focus point until scale completes
+        state.offsetX = startOffsetX;
+        state.offsetY = startOffsetY;
+        draw();
+        if (t < 1) {
+          requestAnimationFrame(stepScale);
+        } else {
+          if (myToken !== currentAnimationToken) return; // cancelled
+          // Phase 2: compute final offsets and animate panning
+          const viewportWidth = canvas.width / state.dpr;
+          const viewportHeight = canvas.height / state.dpr;
+          // Account for UI overlays (poi panel on the left) so the point is centered
+          // within the unobstructed map area. If the panel is visible, shift center
+          // to the right by half the panel width so the map point appears centered
+          // in the remaining view.
+          let overlayShiftX = 0;
+          let overlayShiftY = 0;
+          try {
+            const panel = document.querySelector('.poi-panel');
+            if (panel) {
+              const rect = panel.getBoundingClientRect();
+              const style = window.getComputedStyle(panel);
+              if (style && style.display !== 'none' && rect.width > 8) {
+                overlayShiftX = rect.width / 2;
+              }
+            }
+            // top overlays (e.g., badge) may push visual center down; shift by half height
+            const badgeEl = document.querySelector('.badge');
+            if (badgeEl) {
+              const brect = badgeEl.getBoundingClientRect();
+              const bstyle = window.getComputedStyle(badgeEl);
+              if (bstyle && bstyle.display !== 'none' && brect.height > 6) {
+                overlayShiftY = brect.height / 2;
+              }
+            }
+          } catch (e) {
+            overlayShiftX = 0;
+            overlayShiftY = 0;
+          }
+          const finalOffsetX = viewportWidth / 2 + overlayShiftX - pt.x * state.scale;
+          const finalOffsetY = viewportHeight / 2 + overlayShiftY - pt.y * state.scale;
+          const panStartX = state.offsetX;
+          const panStartY = state.offsetY;
+          const t1 = performance.now();
+          function stepPan(now2) {
+            if (myToken !== currentAnimationToken) return; // cancelled
+            const tt = Math.min(1, (now2 - t1) / half);
+            const e2 = ease(tt);
+            state.offsetX = panStartX + (finalOffsetX - panStartX) * e2;
+            state.offsetY = panStartY + (finalOffsetY - panStartY) * e2;
+            draw();
+            if (tt < 1) {
+              requestAnimationFrame(stepPan);
+            }
+          }
+          requestAnimationFrame(stepPan);
+        }
+      }
+      requestAnimationFrame(stepScale);
+    }
+
+    function fetchWithXHR(url) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('GET', url, true);
+        request.onreadystatechange = () => {
+          if (request.readyState !== 4) {
+            return;
+          }
+          if (request.status >= 200 && request.status < 300) {
+            resolve(request.responseText);
+          } else {
+            reject(new Error(`XHR ${request.status}`));
+          }
+        };
+        request.onerror = () => reject(new Error('XHR failed'));
+        request.send(null);
+      });
+    }
+
+    async function fetchText(url) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Fetch ${response.status}`);
+        }
+        return await response.text();
+      } catch (error) {
+        return await fetchWithXHR(url);
+      }
+    }
+
+    function loadOSMFromText(text, sourceLabel) {
+      // Defensive: avoid attempting to parse extremely large OSM payloads which
+      // may exhaust memory or crash the WebView/renderer on some devices.
+      try {
+        const maxBytes = 5 * 1024 * 1024; // 5 MB
+        if (typeof text === 'string' && text.length > maxBytes) {
+          loadError = new Error('OSM 文件过大，跳过解析（>5MB）');
+          setBadge('OSM 文件过大，等待主机注入或使用更小的地图');
+          console.error('Skipped parsing large OSM payload, length=', text.length);
+          return;
+        }
+
+        const xmlDoc = new DOMParser().parseFromString(text, 'text/xml');
+        const bounds = parseBounds(xmlDoc);
+        if (!bounds) {
+          throw new Error('OSM bounds 解析失败');
+        }
+        renderData.bounds = bounds;
+        computeMapSize(bounds);
+        // build data structures; wrap in try/catch because this can be heavy
+        try {
+          buildRenderData(xmlDoc);
+        } catch (innerErr) {
+          console.error('buildRenderData failed:', innerErr);
+          loadError = innerErr instanceof Error ? innerErr : new Error(String(innerErr));
+          setBadge('OSM 解析失败，查看日志');
+          return;
+        }
+        dataReady = true;
+        fitToView();
+        setBadge(sourceLabel || '本地 OSM 地图 · 支持双指缩放与拖动');
+      } catch (err) {
+        loadError = err instanceof Error ? err : new Error(String(err));
+        console.error('loadOSMFromText parse failed:', loadError);
+        setBadge('OSM 解析异常，等待注入');
+        return;
+      }
+    }
+
+    async function loadOSM() {
+      try {
+        setBadge('正在加载 OSM 数据…');
+        let text = '';
+        let lastError = null;
+        for (const url of OSM_URLS) {
+          try {
+            text = await fetchText(url);
+            if (text) {
+              break;
+            }
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (!text) {
+          throw lastError || new Error('OSM 加载失败');
+        }
+        loadOSMFromText(text, '本地 OSM 地图 · 支持双指缩放与拖动');
+      } catch (error) {
+        loadError = error;
+        const message = error && error.message ? error.message : '未知错误';
+        setBadge(`OSM 加载失败 · ${message} · 等待注入`);
+        if (window.__PENDING_OSM_TEXT) {
+          window.setOSMText(window.__PENDING_OSM_TEXT);
+        } else {
+          setTimeout(() => {
+            if (!dataReady && window.__PENDING_OSM_TEXT) {
+              window.setOSMText(window.__PENDING_OSM_TEXT);
+            }
+          }, 300);
+        }
+      }
+      draw();
+    }
+
+    window.setOSMText = (text) => {
+      try {
+        if (!text || typeof text !== 'string') {
+          throw new Error('注入数据为空');
+        }
+        loadOSMFromText(text, 'OSM 数据已注入 · 支持双指缩放与拖动');
+        loadError = null;
+      } catch (error) {
+        loadError = error;
+        const message = error && error.message ? error.message : '未知错误';
+        setBadge(`OSM 注入失败 · ${message}`);
+      }
+      draw();
+    };
+
+    if (window.__PENDING_OSM_TEXT) {
+      window.setOSMText(window.__PENDING_OSM_TEXT);
+    }
+
+    function drawCustomMarkers() {
+      if (!customMarkers.length) {
+        return;
+      }
+      const theme = THEMES[currentTheme];
+      ctx.fillStyle = theme.poi;
+      ctx.strokeStyle = theme.labelHalo;
+      ctx.lineWidth = 2 / state.scale;
+      ctx.font = `${Math.max(10, 12 / state.scale)}px "PingFang SC", "HarmonyOS Sans", "Microsoft YaHei", sans-serif`;
+      ctx.fillStyle = theme.poi;
+      for (const marker of customMarkers) {
+        const point = project(marker.lat, marker.lon);
+        const radius = 6 / state.scale;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        if (marker.label) {
+          const textX = point.x + 10 / state.scale;
+          const textY = point.y - 6 / state.scale;
+          ctx.strokeText(marker.label, textX, textY);
+          ctx.fillText(marker.label, textX, textY);
+        }
+      }
+    }
+
+    window.setCustomMarkers = (markers) => {
+      if (!Array.isArray(markers)) {
+        return;
+      }
+      customMarkers.length = 0;
+      for (const marker of markers) {
+        if (typeof marker?.lat === 'number' && typeof marker?.lon === 'number') {
+          customMarkers.push({
+            lat: marker.lat,
+            lon: marker.lon,
+            label: typeof marker.label === 'string' ? marker.label : ''
+          });
+        }
+      }
+      draw();
+    };
+
+    function updatePoiSelects() {
+      if (!startSelect || !endSelect) return;
+      const keyword = poiSearch && typeof poiSearch.value === 'string' ? poiSearch.value.trim() : '';
+      const list = keyword
+        ? labelPoiList.filter((p) => p.name.indexOf(keyword) >= 0)
+        : labelPoiList;
+
+      const buildOptions = (selectEl) => {
+        selectEl.innerHTML = '';
+        list.forEach((poi, idx) => {
+          const opt = document.createElement('option');
+          opt.value = String(idx);
+          opt.textContent = poi.name;
+          selectEl.appendChild(opt);
+        });
+      };
+
+      buildOptions(startSelect);
+      buildOptions(endSelect);
+      if (list.length > 1) {
+        endSelect.selectedIndex = Math.min(1, list.length - 1);
+      }
+    }
+
+    function getSelectedPoi(selectEl) {
+      const keyword = poiSearch && typeof poiSearch.value === 'string' ? poiSearch.value.trim() : '';
+      const list = keyword
+        ? labelPoiList.filter((p) => p.name.indexOf(keyword) >= 0)
+        : labelPoiList;
+      const idx = selectEl.selectedIndex;
+      return list[idx] || null;
+    }
+
+    function setRouteFromSelection() {
+      if (!startSelect || !endSelect) return;
+      const start = getSelectedPoi(startSelect);
+      const end = getSelectedPoi(endSelect);
+      if (!start || !end) return;
+      const startPoint = { x: start.position.x, y: start.position.y };
+      const endPoint = { x: end.position.x, y: end.position.y };
+      // schedule route computation briefly to let UI update and allow cancel
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      setBadge('正在规划路线…');
+      pendingRouteTimer = setTimeout(() => {
+        pendingRouteTimer = null;
+        // guard for extremely large road graphs: avoid blocking Dijkstra
+        if (roadGraph && roadGraph.nodes && roadGraph.nodes.length > 3000) {
+          console.warn('Road graph large (', roadGraph.nodes.length, '), falling back to straight-line route');
+          routePath = [startPoint, endPoint];
+        } else {
+          try {
+            routePath = computeRoutePath(startPoint, endPoint);
+          } catch (err) {
+            console.error('computeRoutePath failed:', err);
+            routePath = [startPoint, endPoint];
+          }
+        }
+        currentRoute = { start: startPoint, end: endPoint };
+        // focus on the computed route's midpoint/bounds so both ends are visible
+        currentAnimationToken += 1;
+        if (routePath && routePath.length > 1) {
+          focusOnRoute(routePath, 2.0);
+        } else {
+          focusOnPoint(startPoint, 2.0);
+        }
+        setBadge('路线已规划');
+        draw();
+      }, 60);
+    }
+
+    window.setRoute = (payload) => {
+      if (!payload || !payload.start || !payload.end) return;
+      let startPoint;
+      let endPoint;
+      if (typeof payload.start.x === 'number') {
+        startPoint = { x: payload.start.x, y: payload.start.y };
+      } else {
+        startPoint = project(payload.start.lat, payload.start.lon);
+      }
+      if (typeof payload.end.x === 'number') {
+        endPoint = { x: payload.end.x, y: payload.end.y };
+      } else {
+        endPoint = project(payload.end.lat, payload.end.lon);
+      }
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      setBadge('正在规划路线…');
+      pendingRouteTimer = setTimeout(() => {
+        pendingRouteTimer = null;
+        if (roadGraph && roadGraph.nodes && roadGraph.nodes.length > 3000) {
+          console.warn('Road graph large (', roadGraph.nodes.length, '), falling back to straight-line route');
+          routePath = [startPoint, endPoint];
+        } else {
+          try {
+            routePath = computeRoutePath(startPoint, endPoint);
+          } catch (err) {
+            console.error('computeRoutePath failed:', err);
+            routePath = [startPoint, endPoint];
+          }
+        }
+        currentRoute = payload;
+        // cancel any previous animations and start new focus
+        currentAnimationToken += 1;
+        focusOnPoint(startPoint, 2.0);
+        setBadge('路线已规划');
+        draw();
+      }, 60);
+    };
+
+    window.clearRoute = () => {
+      // cancel animations and clear route
+      currentAnimationToken += 1;
+      if (pendingRouteTimer) {
+        clearTimeout(pendingRouteTimer);
+        pendingRouteTimer = null;
+      }
+      currentRoute = null;
+      routePath = [];
+      // reset any dragging state so user interaction resumes
+      state.dragging = false;
+      setBadge('');
+      draw();
+    };
+
+    window.addCustomMarker = (marker) => {
+      if (marker && typeof marker.lat === 'number' && typeof marker.lon === 'number') {
+        customMarkers.push({
+          lat: marker.lat,
+          lon: marker.lon,
+          label: typeof marker.label === 'string' ? marker.label : ''
+        });
+        draw();
+      }
+    };
+
+    window.setAutoLabelsEnabled = (enabled) => {
+      showAutoLabels = Boolean(enabled);
+      draw();
+    };
+
+    function setTheme(nextTheme) {
+      currentTheme = nextTheme in THEMES ? nextTheme : 'day';
+      document.body.style.background = THEMES[currentTheme].background;
+      if (themeToggle) {
+        themeToggle.textContent = currentTheme === 'day' ? '日间' : '夜间';
+      }
+      draw();
+    }
+
+    function onPointerDown(x, y) {
+      state.dragging = true;
+      state.lastX = x;
+      state.lastY = y;
+    }
+
+    function onPointerMove(x, y) {
+      if (!state.dragging) return;
+      const dx = x - state.lastX;
+      const dy = y - state.lastY;
+      state.offsetX += dx;
+      state.offsetY += dy;
+      state.lastX = x;
+      state.lastY = y;
+      draw();
+    }
+
+    function onPointerUp() {
+      state.dragging = false;
+    }
+
+    canvas.addEventListener('mousedown', (event) => {
+      onPointerDown(event.clientX, event.clientY);
+    });
+
+    canvas.addEventListener('mousemove', (event) => {
+      onPointerMove(event.clientX, event.clientY);
+    });
+
+    window.addEventListener('mouseup', () => {
+      onPointerUp();
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      const delta = event.deltaY > 0 ? -0.1 : 0.1;
+      zoomAt(event.clientX, event.clientY, state.scale + delta);
+      draw();
+    }, { passive: false });
+
+    canvas.addEventListener('touchstart', (event) => {
+      if (event.touches.length === 1) {
+        const touch = event.touches[0];
+        onPointerDown(touch.clientX, touch.clientY);
+      } else if (event.touches.length === 2) {
+        const [t1, t2] = event.touches;
+        const dx = t2.clientX - t1.clientX;
+        const dy = t2.clientY - t1.clientY;
+        state.pinchStartDist = Math.hypot(dx, dy);
+        state.pinchStartScale = state.scale;
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', (event) => {
+      event.preventDefault();
+      if (event.touches.length === 1) {
+        const touch = event.touches[0];
+        onPointerMove(touch.clientX, touch.clientY);
+      } else if (event.touches.length === 2) {
+        const [t1, t2] = event.touches;
+        const dx = t2.clientX - t1.clientX;
+        const dy = t2.clientY - t1.clientY;
+        const dist = Math.hypot(dx, dy);
+        const midpointX = (t1.clientX + t2.clientX) / 2;
+        const midpointY = (t1.clientY + t2.clientY) / 2;
+        const nextScale = state.pinchStartScale * (dist / state.pinchStartDist);
+        zoomAt(midpointX, midpointY, nextScale);
+        draw();
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', () => {
+      onPointerUp();
+    });
+
+    if (zoomInButton) {
+      zoomInButton.addEventListener('click', () => {
+        zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale + 0.2);
+        draw();
+      });
+    }
+
+    if (zoomOutButton) {
+      zoomOutButton.addEventListener('click', () => {
+        zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale - 0.2);
+        draw();
+      });
+    }
+
+    if (themeToggle) {
+      themeToggle.addEventListener('click', () => {
+        const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+        setTheme(nextTheme);
+      });
+      // Also handle touch and keyboard to improve reliability on mobile/embedded WebView
+      themeToggle.addEventListener('touchstart', (e) => {
+        // prevent default so the synthetic click is not delayed or suppressed
+        e.preventDefault();
+        const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+        setTheme(nextTheme);
+      }, { passive: false });
+
+      themeToggle.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          const nextTheme = currentTheme === 'day' ? 'night' : 'day';
+          setTheme(nextTheme);
+        }
+      });
+    }
+
+    if (poiSearch) {
+      poiSearch.addEventListener('input', updatePoiSelects);
+    }
+    if (planRouteBtn) {
+      planRouteBtn.addEventListener('click', setRouteFromSelection);
+    }
+    if (clearRouteBtn) {
+      clearRouteBtn.addEventListener('click', () => {
+        window.clearRoute && window.clearRoute();
+      });
+    }
+
+    window.addEventListener('resize', resize);
+
+    resize();
+  setTheme(currentTheme);
+    loadOSM();
+  </script>
+</body>
+</html>

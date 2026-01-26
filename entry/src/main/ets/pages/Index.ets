@@ -173,6 +173,8 @@ struct Index {
   @State editingSourceKey: string = '';
   @State editingSourceType: string = '';
   @State editingSourcePlaceId: string = '';
+  @State showUi: boolean = true;
+  @State routeVisible: boolean = false;
 
   private poiFallback: Array<MapLabel> = this.buildFallbackLabels();
   private savedFilter: PlaceFilter | null = null;
@@ -291,7 +293,7 @@ struct Index {
       const start = combined[this.startIndex] || combined[0];
       this.routeStartLabel = start ? start.name : '';
     }
-    this.planRoute();
+    this.invalidateRoute();
   }
 
   private cycleEnd(): void {
@@ -305,7 +307,7 @@ struct Index {
       const end = combined[this.endIndex] || combined[1] || combined[0];
       this.routeEndLabel = end ? end.name : '';
     }
-    this.planRoute();
+    this.invalidateRoute();
   }
 
   private swapPoints(): void {
@@ -318,7 +320,7 @@ struct Index {
     const tmp = this.startIndex;
     this.startIndex = this.endIndex;
     this.endIndex = tmp;
-    this.planRoute();
+    this.invalidateRoute();
   }
 
   private getPoiCandidates(): Array<MapLabel> {
@@ -473,7 +475,14 @@ struct Index {
     }
   }
 
-  private planRoute(): void {
+  private invalidateRoute(): void {
+    this.routeVisible = false;
+    this.route = null;
+  }
+
+  private planRoute(): boolean {
+    this.routeVisible = false;
+    this.route = null;
     const combined = this.getPoiCandidates();
     let startPoint: LatLon | null = this.routeStart;
     let endPoint: LatLon | null = this.routeEnd;
@@ -492,19 +501,26 @@ struct Index {
       }
     }
     if (!startPoint || !endPoint) {
-      return;
+      return false;
     }
-    const avoidPoints: Array<LatLon> = new Array<LatLon>();
-    if (this.filter.avoidHazards) {
-      for (let i = 0; i < this.places.length; i++) {
-        const place = this.places[i];
-        if (place.type !== 'normal') {
-          const point: LatLon = { lat: place.lat, lon: place.lon };
-          avoidPoints.push(point);
-        }
-      }
+    const nextRoute = this.routePlanner.buildRoute(startPoint, endPoint, this.renderData);
+    if (!nextRoute.path || nextRoute.path.length < 2) {
+      // fallback: draw straight line to avoid false “invalid” when道路图缺失
+      const fallback: RouteState = { start: startPoint, end: endPoint, path: [startPoint, endPoint] };
+      this.route = fallback;
+      this.routeVisible = true;
+      return true;
     }
-    this.route = this.routePlanner.buildRoute(startPoint, endPoint, this.renderData, avoidPoints);
+    this.route = nextRoute;
+    this.routeVisible = true;
+    return true;
+  }
+
+  private handlePlanRouteClick(): void {
+    const ok = this.planRoute();
+    if (!ok) {
+      promptAction.showToast({ message: '请先选择有效的起终点', duration: 1300 });
+    }
   }
 
   handleMapTap(point: LatLon): void {
@@ -516,14 +532,14 @@ struct Index {
       this.routeStart = point;
       this.routeStartLabel = '地图点';
       this.pickMode = MapPickMode.None;
-      this.planRoute();
+      this.invalidateRoute();
       return;
     }
     if (this.pickMode === MapPickMode.End) {
       this.routeEnd = point;
       this.routeEndLabel = '地图点';
       this.pickMode = MapPickMode.None;
-      this.planRoute();
+      this.invalidateRoute();
       return;
     }
     const place = this.findNearestPlace(point);
@@ -710,7 +726,7 @@ struct Index {
     }
     this.currentPage = PageView.Map;
     this.pickMode = MapPickMode.None;
-    this.planRoute();
+    this.invalidateRoute();
   }
 
   private toggleNightMode(): void {
@@ -743,6 +759,7 @@ struct Index {
       this.hazardMode = false;
     }
     this.refreshPlaces();
+    this.invalidateRoute();
   }
 
   private cloneFilter(filter: PlaceFilter): PlaceFilter {
@@ -756,10 +773,6 @@ struct Index {
       avoidHazards: filter.avoidHazards
     };
     return next;
-  }
-
-  private clearRoute(): void {
-    this.route = null;
   }
 
   private async refreshPlaces(): Promise<void> {
@@ -934,7 +947,7 @@ struct Index {
     this.filter = next;
     this.refreshPlaces();
     if (partial.avoidHazards !== undefined) {
-      this.planRoute();
+      this.invalidateRoute();
     }
   }
 
@@ -965,7 +978,7 @@ struct Index {
     this.filter = next;
     this.refreshPlaces();
     if (this.filter.avoidHazards) {
-      this.planRoute();
+      this.invalidateRoute();
     }
   }
 
@@ -1127,7 +1140,7 @@ struct Index {
     Stack() {
       MapCanvas({
         renderData: this.renderData,
-        route: this.route,
+        route: this.routeVisible ? this.route : null,
         markers: this.buildRouteMarkers(),
         places: this.places,
         currentUser: this.getSession() ? this.getSession()!.username : '',
@@ -1141,163 +1154,211 @@ struct Index {
         .width('100%')
         .height('100%');
 
-      Column() {
-        Row() {
-          Column() {
-            this.buildSearchBar('起点', this.routeStartLabel, true);
-            this.buildSearchBar('终点', this.routeEndLabel, false);
-          }
-          .layoutWeight(1)
-          .margin({ right: 8 });
-
-          Column() {
-            Button('交换')
-              .fontSize(12)
-              .width(56)
-              .height(28)
-              .margin({ bottom: 6 })
-              .onClick(() => this.swapPoints());
-            Button(this.nightMode ? '日间' : '夜间')
-              .onClick(() => this.toggleNightMode())
-              .fontSize(12)
-              .width(56)
-              .height(28)
-              .margin({ bottom: 6 });
-            this.buildAvatarButton();
-          }
-        }
-        .padding({ left: 12, right: 12, top: 12 })
-        .width('100%');
-
-        Row() {
-          Button(this.filter.showSystem ? '系统✓' : '系统')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ showSystem: !this.filter.showSystem }));
-          Button(this.filter.showPublic ? '公共✓' : '公共')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ showPublic: !this.filter.showPublic }));
-          Button(this.filter.showMine ? '我的✓' : '我的')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ showMine: !this.filter.showMine }));
-        }
-        .padding({ left: 12, right: 12, top: 6 })
-        .width('100%')
-        .justifyContent(FlexAlign.SpaceBetween);
-
-        Row() {
-          Button(this.filter.sortBy === 'time' ? '时间✓' : '时间')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ sortBy: 'time' }));
-          Button(this.filter.sortBy === 'likes' ? '点赞✓' : '点赞')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ sortBy: 'likes' }));
-          Button(this.filter.avoidHazards ? '避开水雷✓' : '避开水雷')
-            .fontSize(11)
-            .height(24)
-            .onClick(() => this.updateFilter({ avoidHazards: !this.filter.avoidHazards }));
-        }
-        .padding({ left: 12, right: 12, top: 6 })
-        .width('100%')
-        .justifyContent(FlexAlign.SpaceBetween);
-      }
-      .width('100%')
-      .align(Alignment.TopStart)
-  .hitTestBehavior(HitTestMode.Default)
-  .zIndex(2);
-
-      Row() {
-        Button(this.hazardMode ? '退出水雷' : '水雷排查')
-          .onClick(() => this.toggleHazardMode())
-          .fontSize(12)
-          .width(78)
-          .height(34);
-
         Column() {
-          Button() {
-            Text('＋')
-              .fontSize(18)
-              .fontColor('#1d2a42');
-          }
-          .width(36)
-          .height(36)
-          .backgroundColor('#ffffff')
-          .onClick(() => { this.zoom = this.zoom + 0.2; });
-          Button() {
-            Text('－')
-              .fontSize(18)
-              .fontColor('#1d2a42');
-          }
-          .width(36)
-          .height(36)
-          .backgroundColor('#ffffff')
-          .onClick(() => { this.zoom = this.zoom - 0.2; });
-        }
-        .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.85)' : 'rgba(255, 255, 255, 0.95)')
-        .borderRadius(12)
-        .padding(4);
-      }
-      .padding({ left: 12, right: 12, bottom: 16 })
-      .width('100%')
-      .justifyContent(FlexAlign.SpaceBetween)
-      .align(Alignment.BottomStart)
-  .hitTestBehavior(HitTestMode.Default)
-  .zIndex(2);
-
-      if (this.tapActionVisible) {
-        Column() {
-          if (this.tapPlace) {
-            Text(this.tapPlace.name).fontSize(14).fontWeight(FontWeight.Bold);
-              Text(this.renderPlaceTypeLabel(this.tapPlace.type) + ' · ' + this.renderPlaceStatus(this.tapPlace.status))
-                .fontSize(11)
-                .fontColor('#7c8699');
-              Text('👍 ' + String(this.tapPlace.likes) + ' / 👎 ' + String(this.tapPlace.dislikes))
-                .fontSize(11)
-                .fontColor('#7c8699');
+          if (this.showUi) {
+            Column({ space: 10 }) {
               Row() {
-                if (this.tapPlace.ownerId) {
-                  Button('👍').onClick(() => { this.handleVote(this.tapPlace!.id, 1); });
-                  Button('👎').onClick(() => { this.handleVote(this.tapPlace!.id, -1); });
+                Column({ space: 6 }) {
+                  this.buildSearchBar('起点', this.routeStartLabel, true);
+                  this.buildSearchBar('终点', this.routeEndLabel, false);
                 }
-                if (this.isMinePlace(this.tapPlace)) {
-                  Button('编辑').onClick(() => { this.openEditPlace(this.tapPlace!, false); });
-                  if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
-                    Button('提交审核').onClick(() => { this.handlePublish(this.tapPlace!.id); });
-                  }
-                  Button('删除').onClick(() => { this.handleDelete(this.tapPlace!.id); });
-                } else {
-                  Button('申请修改').onClick(() => { this.openEditPlace(this.tapPlace!, true); });
-                  Button('反馈').onClick(() => { this.handleFeedback(this.tapPlace!.id); });
+                .layoutWeight(1)
+                .margin({ right: 8 });
+
+                Column({ space: 8 }) {
+                  Button('交换')
+                    .fontSize(12)
+                    .width(64)
+                    .height(32)
+                    .onClick(() => this.swapPoints());
+                  Button(this.nightMode ? '日间' : '夜间')
+                    .onClick(() => this.toggleNightMode())
+                    .fontSize(12)
+                    .width(64)
+                    .height(32);
+                  Button('规划路线')
+                    .fontSize(12)
+                    .width(64)
+                    .height(32)
+                    .backgroundColor('#4f79ff')
+                    .fontColor('#ffffff')
+                    .onClick(() => this.handlePlanRouteClick());
+                  this.buildAvatarButton();
                 }
-                Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
-                  .onClick(() => { this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
-                if (this.isAdmin() && this.tapPlace.status === 'pending') {
-                  Button('通过').onClick(() => { this.handleApprove(this.tapPlace!.id); });
-                  Button('拒绝').onClick(() => { this.handleReject(this.tapPlace!.id); });
+              }
+
+              Column({ space: 6 }) {
+                Row() {
+                  Button(this.filter.showSystem ? '系统✓' : '系统')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ showSystem: !this.filter.showSystem }));
+                  Button(this.filter.showPublic ? '公共✓' : '公共')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ showPublic: !this.filter.showPublic }));
+                  Button(this.filter.showMine ? '我的✓' : '我的')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ showMine: !this.filter.showMine }));
                 }
-              }.justifyContent(FlexAlign.SpaceBetween).width('100%');
-          } else {
-            Text('该位置暂无自定义地点').fontSize(12).fontColor('#7c8699');
-            Button('添加自定义位置').onClick(() => this.openAddPlaceFromTap());
+                .justifyContent(FlexAlign.SpaceBetween)
+                .width('100%');
+
+                Row() {
+                  Button(this.filter.sortBy === 'time' ? '时间✓' : '时间')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ sortBy: 'time' }));
+                  Button(this.filter.sortBy === 'likes' ? '点赞✓' : '点赞')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ sortBy: 'likes' }));
+                  Button(this.filter.avoidHazards ? '避开水雷✓' : '避开水雷')
+                    .fontSize(11)
+                    .height(26)
+                    .onClick(() => this.updateFilter({ avoidHazards: !this.filter.avoidHazards }));
+                }
+                .justifyContent(FlexAlign.SpaceBetween)
+                .width('100%');
+              }
+            }
+            .padding({ left: 12, right: 12, top: 12, bottom: 10 })
+            .backgroundColor(this.nightMode ? 'rgba(12, 20, 36, 0.72)' : 'rgba(255, 255, 255, 0.9)')
+            .borderRadius(12)
+            .width('100%')
+            .hitTestBehavior(HitTestMode.Default)
+            .zIndex(3);
           }
-          Button('关闭').onClick(() => this.closeTapAction());
+
+          Column() {
+              if (this.showUi && this.tapActionVisible) {
+                Column() {
+                  if (this.tapPlace) {
+                    Text(this.tapPlace.name).fontSize(14).fontWeight(FontWeight.Bold);
+                    Text(this.renderPlaceTypeLabel(this.tapPlace.type) + ' · ' + this.renderPlaceStatus(this.tapPlace.status))
+                      .fontSize(11)
+                      .fontColor('#7c8699');
+                    Text('👍 ' + String(this.tapPlace.likes) + ' / 👎 ' + String(this.tapPlace.dislikes))
+                      .fontSize(11)
+                      .fontColor('#7c8699');
+                    Row() {
+                      if (this.tapPlace.ownerId) {
+                        Button('👍').onClick(() => { this.handleVote(this.tapPlace!.id, 1); });
+                        Button('👎').onClick(() => { this.handleVote(this.tapPlace!.id, -1); });
+                      }
+                      if (this.isMinePlace(this.tapPlace)) {
+                        Button('编辑').onClick(() => { this.openEditPlace(this.tapPlace!, false); });
+                        if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
+                          Button('提交审核').onClick(() => { this.handlePublish(this.tapPlace!.id); });
+                        }
+                        Button('删除').onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                      } else {
+                        Button('申请修改').onClick(() => { this.openEditPlace(this.tapPlace!, true); });
+                        Button('反馈').onClick(() => { this.handleFeedback(this.tapPlace!.id); });
+                      }
+                      Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
+                        .onClick(() => { this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
+                      if (this.isAdmin() && this.tapPlace.status === 'pending') {
+                        Button('通过').onClick(() => { this.handleApprove(this.tapPlace!.id); });
+                        Button('拒绝').onClick(() => { this.handleReject(this.tapPlace!.id); });
+                      }
+                    }
+                    .justifyContent(FlexAlign.SpaceBetween)
+                    .width('100%');
+                  } else {
+                    Text('该位置暂无自定义地点').fontSize(12).fontColor('#7c8699');
+                    Button('添加自定义位置').onClick(() => this.openAddPlaceFromTap());
+                  }
+                  Button('关闭').onClick(() => this.closeTapAction());
+                }
+                .padding(14)
+                .width('94%')
+                .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.94)' : 'rgba(255, 255, 255, 0.98)')
+                .borderRadius(14)
+                .alignSelf(ItemAlign.Center)
+                .margin({ bottom: 96 })
+                .hitTestBehavior(HitTestMode.Default)
+                .zIndex(4);
+              }
+
+              Row() {
+                if (this.showUi) {
+                  Button(this.hazardMode ? '退出水雷' : '水雷排查')
+                    .onClick(() => this.toggleHazardMode())
+                    .fontSize(12)
+                    .width(96)
+                    .height(38)
+                    .backgroundColor(this.hazardMode ? '#ffb347' : '#ffffff')
+                    .fontColor('#1d2a42')
+                    .borderRadius(12)
+                    .hitTestBehavior(HitTestMode.Default)
+                    .zIndex(3);
+                } else {
+                  Blank().width(96).height(38);
+                }
+
+                Column({ space: 8 }) {
+                  Button(this.showUi ? '隐藏UI' : '显示UI')
+                    .fontSize(12)
+                    .width(96)
+                    .height(32)
+                    .backgroundColor('rgba(255, 255, 255, 0.2)')
+                    .fontColor('#1d2a42')
+                    .borderRadius(12)
+                    .opacity(this.showUi ? 0.35 : 0.6)
+                    .onClick(() => { this.showUi = !this.showUi; });
+
+                  if (this.showUi) {
+                    Column({ space: 6 }) {
+                      Button() {
+                        Text('＋')
+                          .fontSize(18)
+                          .fontColor('#1d2a42');
+                      }
+                      .width(44)
+                      .height(44)
+                      .backgroundColor('#ffffff')
+                      .borderRadius(12)
+                      .onClick(() => { this.zoom = this.zoom + 0.2; });
+                      Button() {
+                        Text('－')
+                          .fontSize(18)
+                          .fontColor('#1d2a42');
+                      }
+                      .width(44)
+                      .height(44)
+                      .backgroundColor('#ffffff')
+                      .borderRadius(12)
+                      .onClick(() => { this.zoom = this.zoom - 0.2; });
+                    }
+                    .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.85)' : 'rgba(255, 255, 255, 0.95)')
+                    .borderRadius(14)
+                    .padding(6)
+                    .hitTestBehavior(HitTestMode.Default)
+                    .zIndex(3);
+                  }
+                }
+                .hitTestBehavior(HitTestMode.Default)
+                .zIndex(3);
+              }
+              .padding({ left: 12, right: 12, bottom: 16 })
+              .width('100%')
+              .justifyContent(FlexAlign.SpaceBetween)
+              .hitTestBehavior(HitTestMode.Default)
+              .zIndex(3);
+            }
+            .width('100%')
+            .layoutWeight(1)
+            .justifyContent(FlexAlign.End);
+          }
+          .width('100%')
+          .height('100%')
+          .align(Alignment.TopStart)
+          .hitTestBehavior(HitTestMode.Transparent);
         }
-        .padding(12)
-        .width('92%')
-        .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.92)' : 'rgba(255, 255, 255, 0.98)')
-        .borderRadius(12)
-  .align(Alignment.Bottom)
-        .margin({ bottom: 16 })
-    .hitTestBehavior(HitTestMode.Default)
-    .zIndex(3);
-      }
-    }
-    .width('100%')
-    .height('100%');
+        .width('100%')
+        .height('100%');
   }
 
   @Builder
