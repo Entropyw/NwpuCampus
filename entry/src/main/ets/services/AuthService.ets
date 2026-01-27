@@ -1,6 +1,6 @@
 import http from '@ohos.net.http';
 import { UserSession } from '../model/MapTypes';
-import { HttpClient, HttpRequestBody } from './HttpClient';
+import { HttpClient, HttpRequestBody, HttpResponse } from './HttpClient';
 
 interface UserRecord {
   username: string;
@@ -62,8 +62,12 @@ export class AuthService {
     if (this.useRemote && this.client) {
       try {
         const payload: AuthRequest = new AuthRequest(trimmed, password);
-        const responseText = await this.client.request(http.RequestMethod.POST, '/api/register', payload);
-        const response = this.parseAuthResponse(responseText);
+        const resp: HttpResponse = await this.client.requestWithStatus(http.RequestMethod.POST, '/api/register', payload);
+        if (resp.status === 401) {
+          this.lastError = this.extractErrorMessage(resp.body) || '用户名或密码错误';
+          return null;
+        }
+        const response = this.parseAuthResponse(resp.body);
         if (response) {
           const session: UserSession = {
             token: response.token,
@@ -73,7 +77,11 @@ export class AuthService {
           this.session = session;
           return session;
         }
-        this.lastError = this.extractErrorMessage(responseText) || '注册失败';
+        if (resp.status >= 200 && resp.status < 300) {
+          this.lastError = this.extractErrorMessage(resp.body) || '注册失败';
+        } else {
+          this.lastError = this.extractErrorMessage(resp.body) || `注册失败，状态码${resp.status}`;
+        }
         return null;
       } catch (e) {
         this.lastError = `网络错误：${String(e)}`;
@@ -92,8 +100,12 @@ export class AuthService {
     if (this.useRemote && this.client) {
       try {
         const payload: AuthRequest = new AuthRequest(trimmed, password);
-        const responseText = await this.client.request(http.RequestMethod.POST, '/api/login', payload);
-        const response = this.parseAuthResponse(responseText);
+        const resp: HttpResponse = await this.client.requestWithStatus(http.RequestMethod.POST, '/api/login', payload);
+        if (resp.status === 401) {
+          this.lastError = this.extractErrorMessage(resp.body) || '用户名或密码错误';
+          return null;
+        }
+        const response = this.parseAuthResponse(resp.body);
         if (response) {
           const session: UserSession = {
             token: response.token,
@@ -103,7 +115,11 @@ export class AuthService {
           this.session = session;
           return session;
         }
-        this.lastError = this.extractErrorMessage(responseText) || '登录失败';
+        if (resp.status >= 200 && resp.status < 300) {
+          this.lastError = this.extractErrorMessage(resp.body) || '登录失败';
+        } else {
+          this.lastError = this.extractErrorMessage(resp.body) || `登录失败，状态码${resp.status}`;
+        }
         return null;
       } catch (e) {
         this.lastError = `网络错误：${String(e)}`;

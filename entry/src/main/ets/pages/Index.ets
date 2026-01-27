@@ -800,8 +800,11 @@ struct Index {
   private updateSessionStatus(session: UserSession | null): void {
     if (session) {
       this.authStatus = `已登录：${session.username}` + (session.isAdmin ? '（管理员）' : '');
+      this.profileNickname = session.username;
     } else {
       this.authStatus = '未登录';
+      this.profileNickname = '';
+      this.profileAvatarUrl = '';
     }
     this.refreshPlaces();
   }

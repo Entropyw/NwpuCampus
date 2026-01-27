@@ -1,4 +1,5 @@
 import http from '@ohos.net.http';
+import { BusinessError } from '@ohos.base';
 
 export class HttpRequestBody {
   username?: string;
@@ -20,6 +21,11 @@ export class HttpRequestBody {
   message?: string;
 }
 
+export interface HttpResponse {
+  status: number;
+  body: string;
+}
+
 export class HttpClient {
   private baseUrl: string;
 
@@ -32,6 +38,11 @@ export class HttpClient {
   }
 
   async request(method: http.RequestMethod, path: string, body?: HttpRequestBody, token?: string): Promise<string> {
+    const resp = await this.requestWithStatus(method, path, body, token);
+    return resp.body;
+  }
+
+  async requestWithStatus(method: http.RequestMethod, path: string, body?: HttpRequestBody, token?: string): Promise<HttpResponse> {
     const url = `${this.baseUrl}${path}`;
     const request = http.createHttp();
     const headers: Record<string, string> = {
@@ -41,7 +52,7 @@ export class HttpClient {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<HttpResponse>((resolve, reject) => {
       request.request(url, {
         method,
         header: headers,
@@ -49,18 +60,15 @@ export class HttpClient {
         extraData: body ? JSON.stringify(body) : undefined,
         connectTimeout: 6000,
         readTimeout: 6000
-      }, (err, data) => {
+      }, (err: BusinessError | null, data: http.HttpResponse) => {
         request.destroy();
         if (err) {
           reject(err);
           return;
         }
-        const resultText = (data.result ? String(data.result) : '{}');
-        try {
-          resolve(resultText);
-        } catch (parseError) {
-          reject(parseError);
-        }
+        const statusCode: number = typeof data.responseCode === 'number' ? data.responseCode : 0;
+        const resultText: string = data && data.result !== undefined ? String(data.result) : '{}';
+        resolve({ status: statusCode, body: resultText });
       });
     });
   }
