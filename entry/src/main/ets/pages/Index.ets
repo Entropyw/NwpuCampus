@@ -162,6 +162,7 @@ struct Index {
   @State profileOldPassword: string = '';
   @State profileNewPassword: string = '';
   @State authStatus: string = '未登录';
+  @State authError: string = '';
   @State username: string = '';
   @State password: string = '';
   @State placeName: string = '';
@@ -307,19 +308,6 @@ struct Index {
       const end = combined[this.endIndex] || combined[1] || combined[0];
       this.routeEndLabel = end ? end.name : '';
     }
-    this.invalidateRoute();
-  }
-
-  private swapPoints(): void {
-    const tmpPoint = this.routeStart;
-    this.routeStart = this.routeEnd;
-    this.routeEnd = tmpPoint;
-    const tmpLabel = this.routeStartLabel;
-    this.routeStartLabel = this.routeEndLabel;
-    this.routeEndLabel = tmpLabel;
-    const tmp = this.startIndex;
-    this.startIndex = this.endIndex;
-    this.endIndex = tmp;
     this.invalidateRoute();
   }
 
@@ -783,16 +771,29 @@ struct Index {
 
   private async handleLogin(): Promise<void> {
     const session = await this.authService.login(this.username, this.password);
-    this.updateSessionStatus(session);
+    if (session) {
+      this.authError = '';
+      this.updateSessionStatus(session);
+    } else {
+      this.authError = this.authService.getLastError() || '登录失败';
+      this.updateSessionStatus(null);
+    }
   }
 
   private async handleRegister(): Promise<void> {
     const session = await this.authService.register(this.username, this.password);
-    this.updateSessionStatus(session);
+    if (session) {
+      this.authError = '';
+      this.updateSessionStatus(session);
+    } else {
+      this.authError = this.authService.getLastError() || '注册失败';
+      this.updateSessionStatus(null);
+    }
   }
 
   private handleLogout(): void {
     this.authService.logout();
+    this.authError = '';
     this.updateSessionStatus(null);
   }
 
@@ -1166,11 +1167,6 @@ struct Index {
                 .margin({ right: 8 });
 
                 Column({ space: 8 }) {
-                  Button('交换')
-                    .fontSize(12)
-                    .width(64)
-                    .height(32)
-                    .onClick(() => this.swapPoints());
                   Button(this.nightMode ? '日间' : '夜间')
                     .onClick(() => this.toggleNightMode())
                     .fontSize(12)
@@ -1434,7 +1430,14 @@ struct Index {
         Button('登录').onClick(() => { this.handleLogin(); });
         Button('注册').onClick(() => { this.handleRegister(); });
         Button('退出').onClick(() => this.handleLogout());
-      }.justifyContent(FlexAlign.SpaceBetween).width('100%').margin({ bottom: 16 });
+      }.justifyContent(FlexAlign.SpaceBetween).width('100%').margin({ bottom: 6 });
+
+      if (this.authError) {
+        Text(this.authError)
+          .fontSize(12)
+          .fontColor('#ff4d4f')
+          .margin({ bottom: 10 });
+      }
 
       Divider().strokeWidth(1).color('#e1e6ef');
       Text('个人资料').fontSize(13).fontWeight(FontWeight.Bold);

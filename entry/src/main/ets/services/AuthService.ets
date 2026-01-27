@@ -19,6 +19,10 @@ interface AuthResponse {
   user: AuthUserInfo;
 }
 
+interface ErrorResponse {
+  error?: string;
+}
+
 class AuthRequest extends HttpRequestBody {
   constructor(username: string, password: string) {
     super();
@@ -32,6 +36,7 @@ export class AuthService {
   private session: UserSession | null = null;
   private client: HttpClient | null = null;
   private useRemote: boolean = false;
+  private lastError: string = '';
 
   constructor() {
     this.users.set('admin', { username: 'admin', password: 'admin123', isAdmin: true });
@@ -40,17 +45,24 @@ export class AuthService {
   enableRemote(baseUrl: string): void {
     this.client = new HttpClient(baseUrl);
     this.useRemote = true;
+    this.lastError = '';
   }
 
   async register(username: string, password: string): Promise<UserSession | null> {
     const trimmed = username.trim();
-    if (!trimmed || this.users.has(trimmed)) {
+    this.lastError = '';
+    if (!trimmed) {
+      this.lastError = '用户名不能为空';
+      return null;
+    }
+    if (this.users.has(trimmed)) {
+      this.lastError = '用户已存在';
       return null;
     }
     if (this.useRemote && this.client) {
       try {
-  const payload: AuthRequest = new AuthRequest(trimmed, password);
-  const responseText = await this.client.request(http.RequestMethod.POST, '/api/register', payload);
+        const payload: AuthRequest = new AuthRequest(trimmed, password);
+        const responseText = await this.client.request(http.RequestMethod.POST, '/api/register', payload);
         const response = this.parseAuthResponse(responseText);
         if (response) {
           const session: UserSession = {
@@ -61,8 +73,11 @@ export class AuthService {
           this.session = session;
           return session;
         }
+        this.lastError = this.extractErrorMessage(responseText) || '注册失败';
+        return null;
       } catch (e) {
-        // fallback to local
+        this.lastError = `网络错误：${String(e)}`;
+        return null;
       }
     }
     const record: UserRecord = { username: trimmed, password, isAdmin: false };
@@ -71,11 +86,13 @@ export class AuthService {
   }
 
   async login(username: string, password: string): Promise<UserSession | null> {
-    const record = this.users.get(username.trim());
+    const trimmed = username.trim();
+    this.lastError = '';
+    const record = this.users.get(trimmed);
     if (this.useRemote && this.client) {
       try {
-  const payload: AuthRequest = new AuthRequest(username.trim(), password);
-  const responseText = await this.client.request(http.RequestMethod.POST, '/api/login', payload);
+        const payload: AuthRequest = new AuthRequest(trimmed, password);
+        const responseText = await this.client.request(http.RequestMethod.POST, '/api/login', payload);
         const response = this.parseAuthResponse(responseText);
         if (response) {
           const session: UserSession = {
@@ -86,11 +103,15 @@ export class AuthService {
           this.session = session;
           return session;
         }
+        this.lastError = this.extractErrorMessage(responseText) || '登录失败';
+        return null;
       } catch (e) {
-        // fallback to local
+        this.lastError = `网络错误：${String(e)}`;
+        return null;
       }
     }
     if (!record || record.password !== password) {
+      this.lastError = '用户名或密码错误';
       return null;
     }
     const token = `${record.username}-${Date.now()}`;
@@ -100,21 +121,39 @@ export class AuthService {
 
   logout(): void {
     this.session = null;
+    this.lastError = '';
   }
 
   getSession(): UserSession | null {
     return this.session;
   }
 
+  getLastError(): string {
+    return this.lastError;
+  }
+
   private parseAuthResponse(text: string): AuthResponse | null {
     try {
-      const raw = JSON.parse(text) as AuthResponse;
+      const raw: AuthResponse = JSON.parse(text) as AuthResponse;
       if (!raw || !raw.token || !raw.user) {
         return null;
       }
       return raw;
-    } catch (e) {
+    } catch {
       return null;
     }
+  }
+
+  private extractErrorMessage(text: string): string {
+    try {
+      const raw: ErrorResponse = JSON.parse(text) as ErrorResponse;
+      const errMsg: string | undefined = raw ? raw.error : undefined;
+      if (typeof errMsg === 'string' && errMsg.length > 0) {
+        return errMsg;
+      }
+    } catch {
+      // ignore parse error
+    }
+    return '';
   }
 }
