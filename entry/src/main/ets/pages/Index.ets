@@ -1471,8 +1471,20 @@ struct Index {
       Text('我的审核').fontSize(13).fontWeight(FontWeight.Bold);
       ForEach(this.pendingPlaces, (place: Place) => {
         Row() {
-          Text(place.name).fontSize(12);
-          Text(this.renderPlaceStatus(place.status)).fontSize(11).fontColor('#7c8699');
+          Column() {
+            Text(place.name).fontSize(12);
+            Text(this.renderPlaceStatus(place.status)).fontSize(11).fontColor('#7c8699');
+          }
+          if (this.isAdmin()) {
+            Row({ space: 6 }) {
+              Button('接受')
+                .fontSize(11)
+                .onClick(() => { this.handleApprove(place.id); });
+              Button('拒绝')
+                .fontSize(11)
+                .onClick(() => { this.handleReject(place.id); });
+            }
+          }
         }.justifyContent(FlexAlign.SpaceBetween).width('100%').margin({ bottom: 6 });
       }, (place: Place) => `pending-${place.id}`);
     }
