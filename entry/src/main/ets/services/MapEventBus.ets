@@ -18,10 +18,17 @@ export class LongPressHandler {
   }
 }
 
+export class SizeHandler {
+  onSize(_width: number, _height: number): void {
+    // override in subclass
+  }
+}
+
 export class MapEventBus {
   private static tapHandlers: Array<TapHandler> = [];
   private static transformHandlers: Array<TransformHandler> = [];
   private static longPressHandlers: Array<LongPressHandler> = [];
+  private static sizeHandlers: Array<SizeHandler> = [];
 
   static registerTapHandler(handler: TapHandler): void {
     if (!handler) {
@@ -67,6 +74,30 @@ export class MapEventBus {
         h.onLongPress(point);
       } catch (e) {
         console.error('MapEventBus.longPress handler error', e);
+      }
+    }
+  }
+
+  static registerSizeHandler(handler: SizeHandler): void {
+    if (!handler) {
+      return;
+    }
+    MapEventBus.sizeHandlers.push(handler);
+  }
+
+  static unregisterSizeHandler(handler: SizeHandler): void {
+    const idx = MapEventBus.sizeHandlers.indexOf(handler);
+    if (idx >= 0) {
+      MapEventBus.sizeHandlers.splice(idx, 1);
+    }
+  }
+
+  static emitSize(width: number, height: number): void {
+    for (const h of MapEventBus.sizeHandlers) {
+      try {
+        h.onSize(width, height);
+      } catch (e) {
+        console.error('MapEventBus.size handler error', e);
       }
     }
   }

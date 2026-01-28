@@ -66,6 +66,8 @@ export interface UserSession {
   token: string;
   username: string;
   isAdmin: boolean;
+  email?: string;
+  requireEmailBind?: boolean;
 }
 
 export interface PlaceTypeFlags {

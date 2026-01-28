@@ -112,6 +112,7 @@ export class PlaceService {
   private hiddenByUser: Map<string, Set<string>> = new Map();
   private hiddenLoadedFor: string = '';
   private hiddenLoadedAt: number = 0;
+  private voteRecords: Map<string, Map<string, number>> = new Map();
 
   enableRemote(baseUrl: string): void {
     this.client = new HttpClient(baseUrl);
@@ -337,6 +338,10 @@ export class PlaceService {
     if (!session || (place.ownerId !== session.username && !session.isAdmin)) {
       return false;
     }
+    if (place.sourceType === 'system' && session.isAdmin) {
+      this.places.splice(index, 1);
+      return true;
+    }
     if (this.useRemote && this.client && session.token) {
       try {
         await this.client.request(http.RequestMethod.DELETE, `/api/places/${placeId}`, undefined, session.token);
@@ -353,10 +358,28 @@ export class PlaceService {
     if (!place) {
       return false;
     }
+    if (session) {
+      const record = this.voteRecords.get(session.username) || new Map<string, number>();
+      const prev = record.get(placeId) || 0;
+      if (prev !== 0) {
+        return false;
+      }
+    }
     if (this.useRemote && this.client && session && session.token) {
       try {
   const payload: VoteRequest = new VoteRequest(delta);
-  await this.client.request(http.RequestMethod.POST, `/api/places/${placeId}/vote`, payload, session.token);
+  const responseText = await this.client.request(http.RequestMethod.POST, `/api/places/${placeId}/vote`, payload, session.token);
+  const response = this.parsePlaceWrapper(responseText);
+  const updated = response ? this.fromServerPlace(response.place) : null;
+  if (updated) {
+    this.mergePlace(updated);
+    if (session) {
+      const record = this.voteRecords.get(session.username) || new Map<string, number>();
+      record.set(placeId, delta);
+      this.voteRecords.set(session.username, record);
+    }
+    return true;
+  }
       } catch (e) {
         // fallback to local
       }
@@ -366,7 +389,47 @@ export class PlaceService {
     } else {
       place.dislikes += 1;
     }
+    if (session) {
+      const record = this.voteRecords.get(session.username) || new Map<string, number>();
+      record.set(placeId, delta);
+      this.voteRecords.set(session.username, record);
+    }
     return true;
+  }
+
+  hasVoted(placeId: string, session: UserSession | null): boolean {
+    if (!session) {
+      return false;
+    }
+    const record = this.voteRecords.get(session.username);
+    if (!record) {
+      return false;
+    }
+    return (record.get(placeId) || 0) !== 0;
+  }
+
+  async listMyPlaces(session: UserSession | null): Promise<Array<Place>> {
+    if (!session) {
+      return [];
+    }
+    if (this.useRemote && this.client && session.token) {
+      try {
+        const responseText = await this.client.request(http.RequestMethod.GET, '/api/places?scope=mine', undefined, session.token);
+        const mineResp = this.parsePlacesResponse(responseText);
+        const minePlaces = mineResp ? this.mapServerPlaces(mineResp.places) : [];
+        const pending = mineResp ? this.mapServerPlaces(mineResp.pending) : [];
+        const combined = [...minePlaces, ...pending];
+        combined.forEach((place) => this.mergePlace(place));
+        return combined;
+      } catch (e) {
+        // fallback to local
+      }
+    }
+    return this.places.filter((item) => item.ownerId === session.username);
+  }
+
+  getCachedPlaces(): Array<Place> {
+    return this.places.slice();
   }
 
   async toggleHidden(placeId: string, hidden: boolean, session: UserSession | null): Promise<boolean> {

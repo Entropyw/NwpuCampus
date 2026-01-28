@@ -151,13 +151,63 @@ export struct MapCanvas {
 
   private drawPlaces(ctx: CanvasRenderingContext2D, bounds: Bounds): void {
     for (const place of this.places) {
-      this.drawMarker(ctx, bounds, place.lat, place.lon, this.placeColor(place), place.name);
+      if (place.type === 'water') {
+        this.drawWaterMine(ctx, bounds, place.lat, place.lon, this.placeColor(place), place.name);
+      } else {
+        this.drawMarker(ctx, bounds, place.lat, place.lon, this.placeColor(place), place.name);
+      }
+    }
+  }
+
+  private drawWaterMine(ctx: CanvasRenderingContext2D, bounds: Bounds, lat: number, lon: number, color: string, label: string): void {
+    const width = this.canvasSize.width;
+    const height = this.canvasSize.height;
+    const zoom = clampZoom(this.zoom);
+    const point = project(lat, lon, bounds, width, height, zoom, this.offsetX, this.offsetY);
+    const size = this.scaleMarker(9);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, size, 0, Math.PI * 2);
+    ctx.fill();
+    const spike = size * 0.6;
+    ctx.beginPath();
+    ctx.moveTo(point.x, point.y - size - spike);
+    ctx.lineTo(point.x - spike * 0.35, point.y - size * 0.2);
+    ctx.lineTo(point.x + spike * 0.35, point.y - size * 0.2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(point.x, point.y + size + spike);
+    ctx.lineTo(point.x - spike * 0.35, point.y + size * 0.2);
+    ctx.lineTo(point.x + spike * 0.35, point.y + size * 0.2);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(point.x - size - spike, point.y);
+    ctx.lineTo(point.x - size * 0.2, point.y - spike * 0.35);
+    ctx.lineTo(point.x - size * 0.2, point.y + spike * 0.35);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(point.x + size + spike, point.y);
+    ctx.lineTo(point.x + size * 0.2, point.y - spike * 0.35);
+    ctx.lineTo(point.x + size * 0.2, point.y + spike * 0.35);
+    ctx.closePath();
+    ctx.fill();
+    if (label) {
+      ctx.fillStyle = this.nightMode ? '#e7edf7' : '#1d2a42';
+      ctx.font = `${this.scaleFont(14)}px sans-serif`;
+      ctx.fillText(label, point.x + size + 2, point.y - size * 0.6);
     }
   }
 
   private drawMarkers(ctx: CanvasRenderingContext2D, bounds: Bounds): void {
     for (const marker of this.markers) {
-      this.drawMarker(ctx, bounds, marker.lat, marker.lon, '#4f79ff', marker.label || '');
+      if (marker.kind === 'focus') {
+        this.drawFocusMarker(ctx, bounds, marker.lat, marker.lon, marker.label || '');
+      } else {
+        this.drawMarker(ctx, bounds, marker.lat, marker.lon, '#4f79ff', marker.label || '');
+      }
     }
   }
 
@@ -182,6 +232,26 @@ export struct MapCanvas {
       ctx.fillStyle = this.nightMode ? '#e7edf7' : '#1d2a42';
   ctx.font = `${this.scaleFont(15)}px sans-serif`;
       ctx.fillText(label, point.x + radius + 2, point.y - radius - 1);
+    }
+  }
+
+  private drawFocusMarker(ctx: CanvasRenderingContext2D, bounds: Bounds, lat: number, lon: number, label: string): void {
+    const width = this.canvasSize.width;
+    const height = this.canvasSize.height;
+    const zoom = clampZoom(this.zoom);
+    const point = project(lat, lon, bounds, width, height, zoom, this.offsetX, this.offsetY);
+    const size = this.scaleMarker(10);
+    ctx.fillStyle = '#ffb703';
+    ctx.beginPath();
+    ctx.moveTo(point.x, point.y - size);
+    ctx.lineTo(point.x - size * 0.6, point.y + size * 0.6);
+    ctx.lineTo(point.x + size * 0.6, point.y + size * 0.6);
+    ctx.closePath();
+    ctx.fill();
+    if (label) {
+      ctx.fillStyle = this.nightMode ? '#f8fafc' : '#1d2a42';
+      ctx.font = `${this.scaleFont(15)}px sans-serif`;
+      ctx.fillText(label, point.x + size + 4, point.y - size * 0.6);
     }
   }
 
@@ -225,7 +295,7 @@ export struct MapCanvas {
     const isMine = place.ownerId && this.currentUser && place.ownerId === this.currentUser;
     switch (place.type) {
       case 'water':
-        return isMine ? '#36c2ff' : '#4cb3ff';
+        return isMine ? '#24a3ff' : '#4cb3ff';
       case 'slippery':
         return isMine ? '#b995ff' : '#9c7cff';
       case 'danger':
@@ -245,6 +315,7 @@ export struct MapCanvas {
       const h = info.height;
       if (typeof w === 'number' && typeof h === 'number') {
         this.canvasSize = { width: w, height: h };
+        MapEventBus.emitSize(w, h);
       }
     } catch (e) {
       // ignore
