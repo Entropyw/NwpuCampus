@@ -224,6 +224,7 @@ struct Index {
   @State route: RouteState | null = null;
   @State places: Array<Place> = [];
   @State pendingPlaces: Array<Place> = [];
+  @State codeCooldownUntil: number = 0;
   @State selectedPoint: LatLon | null = null;
 
   private apiBase: string = 'http://121.36.80.168:8081';
@@ -247,6 +248,7 @@ struct Index {
   private messagePageSize: number = 20;
 
   private colorPrimary: string = '#7B7CF6';
+  private colorPrimaryLight: string = '#f1edff';
   private colorAccent: string = '#2EC4B6';
   private colorWarn: string = '#F6C177';
   private colorDanger: string = '#F28482';
@@ -1028,12 +1030,19 @@ struct Index {
   }
 
   private async sendRegisterCode(): Promise<void> {
+    const now = Date.now();
+    if (now < this.codeCooldownUntil) {
+      const remaining = Math.ceil((this.codeCooldownUntil - now) / 1000);
+      promptAction.showToast({ message: `请${remaining}秒后再试`, duration: 1200 });
+      return;
+    }
     if (!this.username || !this.registerEmail) {
       promptAction.showToast({ message: '请输入账号和邮箱', duration: 1500 });
       return;
     }
     const ok = await this.authService.sendEmailCode(this.username, this.registerEmail);
     if (ok) {
+      this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
     } else {
       promptAction.showToast({ message: this.authService.getLastError() || '发送失败', duration: 1500 });
@@ -1041,12 +1050,23 @@ struct Index {
   }
 
   private async sendResetCode(): Promise<void> {
+    const now = Date.now();
+    if (now < this.codeCooldownUntil) {
+      const remaining = Math.ceil((this.codeCooldownUntil - now) / 1000);
+      promptAction.showToast({ message: `请${remaining}秒后再试`, duration: 1200 });
+      return;
+    }
     if (!this.username || !this.resetEmail) {
       promptAction.showToast({ message: '请输入账号和邮箱', duration: 1500 });
       return;
     }
+    if (this.username.trim().toLowerCase() === 'admin') {
+      promptAction.showToast({ message: '管理员账户不支持找回密码', duration: 1500 });
+      return;
+    }
     const ok = await this.authService.sendEmailCode(this.username, this.resetEmail);
     if (ok) {
+      this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
     } else {
       promptAction.showToast({ message: this.authService.getLastError() || '发送失败', duration: 1500 });
@@ -1054,6 +1074,12 @@ struct Index {
   }
 
   private async sendBindCode(): Promise<void> {
+    const now = Date.now();
+    if (now < this.codeCooldownUntil) {
+      const remaining = Math.ceil((this.codeCooldownUntil - now) / 1000);
+      promptAction.showToast({ message: `请${remaining}秒后再试`, duration: 1200 });
+      return;
+    }
     const session = this.getSession();
     if (!session || !this.bindEmail) {
       promptAction.showToast({ message: '请输入绑定邮箱', duration: 1500 });
@@ -1061,9 +1087,34 @@ struct Index {
     }
     const ok = await this.authService.sendEmailCode(session.username, this.bindEmail);
     if (ok) {
+      this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
     } else {
       promptAction.showToast({ message: this.authService.getLastError() || '发送失败', duration: 1500 });
+    }
+  }
+
+  private async handleResetPassword(): Promise<void> {
+    if (this.username.trim().toLowerCase() === 'admin') {
+      this.authError = '管理员账户不支持找回密码';
+      return;
+    }
+    if (!this.username || !this.resetEmail || !this.resetCode || !this.resetNewPassword) {
+      this.authError = '请填写完整的找回信息';
+      return;
+    }
+    const verified = await this.authService.verifyEmailCode(this.username, this.resetCode);
+    if (!verified) {
+      this.authError = this.authService.getLastError() || '验证码验证失败';
+      return;
+    }
+    const ok = await this.authService.resetPassword(this.username, this.resetCode, this.resetNewPassword);
+    if (ok) {
+      this.authError = '';
+      promptAction.showToast({ message: '密码已重置，请使用新密码登录', duration: 1500 });
+      this.currentPage = PageView.Login;
+    } else {
+      this.authError = this.authService.getLastError() || '重置失败';
     }
   }
 
@@ -1082,26 +1133,6 @@ struct Index {
     this.bindingRequired = false;
     promptAction.showToast({ message: '邮箱绑定成功', duration: 1200 });
     this.currentPage = PageView.Profile;
-  }
-
-  private async handleResetPassword(): Promise<void> {
-    if (!this.username || !this.resetEmail || !this.resetCode || !this.resetNewPassword) {
-      promptAction.showToast({ message: '请填写完整信息', duration: 1500 });
-      return;
-    }
-    const verified = await this.authService.verifyEmailCode(this.username, this.resetCode);
-    if (!verified) {
-      promptAction.showToast({ message: this.authService.getLastError() || '验证失败', duration: 1500 });
-      return;
-    }
-    const ok = await this.authService.resetPassword(this.username, this.resetCode, this.resetNewPassword);
-    if (ok) {
-      promptAction.showToast({ message: '密码已重置，请重新登录', duration: 1500 });
-      this.resetNewPassword = '';
-      this.currentPage = PageView.Login;
-    } else {
-      promptAction.showToast({ message: this.authService.getLastError() || '重置失败', duration: 1500 });
-    }
   }
 
   private handleLogout(): void {
@@ -1843,8 +1874,8 @@ struct Index {
           Button(this.rememberMe ? '✓ 记住我' : '记住我')
             .height(28)
             .fontSize(11)
-            .backgroundColor(this.rememberMe ? '#e8e5ff' : '#f0f2f7')
-            .fontColor('#39465c')
+            .backgroundColor(this.rememberMe ? this.colorPrimary : this.colorPrimaryLight)
+            .fontColor(this.rememberMe ? '#ffffff' : this.colorPrimary)
             .onClick(() => { this.rememberMe = !this.rememberMe; });
           Blank().layoutWeight(1);
           Text('忘记密码?')
@@ -1866,7 +1897,7 @@ struct Index {
             .onClick(() => { this.handleLogin(); });
         }
 
-        Row() {
+        Row({ space: 4 }) {
           Text('没有账号？')
             .fontSize(12)
             .fontColor('#7c8699');
@@ -1874,16 +1905,6 @@ struct Index {
             .fontSize(12)
             .fontColor(this.colorPrimary)
             .onClick(() => { this.currentPage = PageView.Register; });
-          Blank().layoutWeight(1);
-          Text('忘记密码?')
-            .fontSize(11)
-            .fontColor('#7c8699')
-            .onClick(() => {
-              this.resetEmail = this.username;
-              this.resetCode = '';
-              this.resetNewPassword = '';
-              this.currentPage = PageView.ResetPassword;
-            });
         }
 
         if (this.authError) {
@@ -1908,7 +1929,10 @@ struct Index {
     private buildRegisterPage(): void {
       Column({ space: 12 }) {
         Row() {
-          Button('返回').onClick(() => { this.currentPage = PageView.Login; });
+          Button('返回')
+            .backgroundColor(this.colorPrimaryLight)
+            .fontColor(this.colorPrimary)
+            .onClick(() => { this.currentPage = PageView.Login; });
           Text('注册')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
@@ -1944,7 +1968,8 @@ struct Index {
           Button('发送验证码')
             .height(32)
             .fontSize(12)
-            .backgroundColor('#eef1ff')
+            .backgroundColor(this.colorPrimary)
+            .fontColor('#ffffff')
             .onClick(() => { this.sendRegisterCode(); });
         }
 
@@ -1973,7 +1998,10 @@ struct Index {
   private buildBindEmailPage(): void {
     Column({ space: 12 }) {
       Row() {
-        Button('返回').onClick(() => {
+        Button('返回')
+          .backgroundColor(this.colorPrimaryLight)
+          .fontColor(this.colorPrimary)
+          .onClick(() => {
           if (this.bindingRequired) {
             this.authService.logout();
             this.updateSessionStatus(null);
@@ -2013,7 +2041,8 @@ struct Index {
         Button('发送验证码')
           .height(32)
           .fontSize(12)
-          .backgroundColor('#eef1ff')
+          .backgroundColor(this.colorPrimary)
+          .fontColor('#ffffff')
           .onClick(() => { this.sendBindCode(); });
       }
 
@@ -2032,7 +2061,10 @@ struct Index {
   private buildResetPasswordPage(): void {
     Column({ space: 12 }) {
       Row() {
-        Button('返回').onClick(() => { this.currentPage = PageView.Login; });
+        Button('返回')
+          .backgroundColor(this.colorPrimaryLight)
+          .fontColor(this.colorPrimary)
+          .onClick(() => { this.currentPage = PageView.Login; });
         Text('找回密码')
           .fontSize(16)
           .fontWeight(FontWeight.Bold)
@@ -2061,7 +2093,8 @@ struct Index {
         Button('发送验证码')
           .height(32)
           .fontSize(12)
-          .backgroundColor('#eef1ff')
+          .backgroundColor(this.colorPrimary)
+          .fontColor('#ffffff')
           .onClick(() => { this.sendResetCode(); });
       }
 
@@ -2118,14 +2151,16 @@ struct Index {
                     .fontSize(12)
                     .width(64)
                     .height(32)
-                    .backgroundColor('#f1edff')
-                    .fontColor(this.colorPrimary)
+                    .backgroundColor(this.colorPrimary)
+                    .fontColor('#ffffff')
                     .onClick(() => this.openHotPlaces());
                   Button(this.nightMode ? '日间' : '夜间')
                     .onClick(() => this.toggleNightMode())
                     .fontSize(12)
                     .width(64)
-                    .height(32);
+                    .height(32)
+                    .backgroundColor(this.colorPrimary)
+                    .fontColor('#ffffff');
                   Button('规划路线')
                     .fontSize(12)
                     .width(64)
@@ -2165,43 +2200,71 @@ struct Index {
                     Row() {
                       if (this.tapPlace.ownerId) {
                         Button('👍')
-                          .backgroundColor('#ffffff')
-                          .fontColor('#1aa168')
+                          .backgroundColor(this.colorPrimary)
+                          .fontColor('#ffffff')
                           .onClick(() => { this.handleVote(this.tapPlace!.id, 1); });
                         Button('👎')
-                          .backgroundColor('#ffffff')
-                          .fontColor('#d23f3f')
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
                           .onClick(() => { this.handleVote(this.tapPlace!.id, -1); });
                       }
                       if (this.isMinePlace(this.tapPlace)) {
-                        Button('编辑').onClick(() => { this.openEditPlace(this.tapPlace!, false); });
+                        Button('编辑')
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
+                          .onClick(() => { this.openEditPlace(this.tapPlace!, false); });
                         if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
                           Button(this.isAdmin() ? '确认修改并应用' : '提交审核')
+                            .backgroundColor(this.colorPrimary)
+                            .fontColor('#ffffff')
                             .onClick(() => { this.handleApply(this.tapPlace!.id); });
                         }
-                        Button('删除').onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                        Button('删除')
+                          .backgroundColor(this.colorPrimary)
+                          .fontColor('#ffffff')
+                          .onClick(() => { this.handleDelete(this.tapPlace!.id); });
                       } else {
-                        Button('申请修改').onClick(() => { this.openEditPlace(this.tapPlace!, true); });
-                        Button('反馈').onClick(() => { this.handleFeedback(this.tapPlace!.id); });
+                        Button('申请修改')
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
+                          .onClick(() => { this.openEditPlace(this.tapPlace!, true); });
+                        Button('反馈')
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
+                          .onClick(() => { this.handleFeedback(this.tapPlace!.id); });
                       }
                       Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
+                        .backgroundColor(this.colorPrimaryLight)
+                        .fontColor(this.colorPrimary)
                         .onClick(() => { this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
                       if (this.isAdmin() && this.tapPlace.status === 'pending') {
-                        Button('通过').onClick(() => { this.handleApprove(this.tapPlace!.id); });
-                        Button('拒绝').onClick(() => { this.handleReject(this.tapPlace!.id); });
+                        Button('通过')
+                          .backgroundColor(this.colorPrimary)
+                          .fontColor('#ffffff')
+                          .onClick(() => { this.handleApprove(this.tapPlace!.id); });
+                        Button('拒绝')
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
+                          .onClick(() => { this.handleReject(this.tapPlace!.id); });
                       }
                     }
                     .justifyContent(FlexAlign.SpaceBetween)
                     .width('100%');
                   } else {
                     Text('该位置暂无自定义地点').fontSize(12).fontColor('#7c8699');
-                    Button('添加自定义位置').onClick(() => this.openAddPlaceFromTap());
+                    Button('添加自定义位置')
+                      .backgroundColor(this.colorPrimary)
+                      .fontColor('#ffffff')
+                      .onClick(() => this.openAddPlaceFromTap());
                     Button('标记为水雷')
-                      .backgroundColor('#e6f4ff')
-                      .fontColor('#1d6fd6')
+                      .backgroundColor(this.colorPrimaryLight)
+                      .fontColor(this.colorPrimary)
                       .onClick(() => { void this.handleMarkWaterMine(); });
                   }
-                  Button('关闭').onClick(() => this.closeTapAction());
+                  Button('关闭')
+                    .backgroundColor(this.colorPrimaryLight)
+                    .fontColor(this.colorPrimary)
+                    .onClick(() => this.closeTapAction());
                 }
                 .padding(14)
                 .width('94%')
@@ -2220,8 +2283,8 @@ struct Index {
                     .fontSize(12)
                     .width(96)
                     .height(38)
-                    .backgroundColor(this.hazardMode ? this.colorWarn : '#ffffff')
-                    .fontColor('#1d2a42')
+                    .backgroundColor(this.hazardMode ? this.colorPrimary : this.colorPrimaryLight)
+                    .fontColor(this.hazardMode ? '#ffffff' : this.colorPrimary)
                     .borderRadius(12)
                     .hitTestBehavior(HitTestMode.Default)
                     .zIndex(3);
@@ -2234,8 +2297,8 @@ struct Index {
                     .fontSize(12)
                     .width(96)
                     .height(32)
-                    .backgroundColor('rgba(255, 255, 255, 0.2)')
-                    .fontColor('#1d2a42')
+                    .backgroundColor(this.colorPrimaryLight)
+                    .fontColor(this.colorPrimary)
                     .borderRadius(12)
                     .opacity(this.showUi ? 0.35 : 0.6)
                     .onClick(() => { this.showUi = !this.showUi; });
@@ -2249,7 +2312,7 @@ struct Index {
                       }
                       .width(44)
                       .height(44)
-                      .backgroundColor('#ffffff')
+                      .backgroundColor(this.colorPrimaryLight)
                       .borderRadius(12)
                       .onClick(() => { this.zoom = this.zoom + 0.2; });
                       Button() {
@@ -2259,7 +2322,7 @@ struct Index {
                       }
                       .width(44)
                       .height(44)
-                      .backgroundColor('#ffffff')
+                      .backgroundColor(this.colorPrimaryLight)
                       .borderRadius(12)
                       .onClick(() => { this.zoom = this.zoom - 0.2; });
                     }
@@ -2406,8 +2469,8 @@ struct Index {
             .onClick(() => { this.currentPage = PageView.Login; });
         } else {
           Button('退出登录')
-            .backgroundColor('#f0f2f7')
-            .fontColor('#1d2a42')
+            .backgroundColor(this.colorPrimaryLight)
+            .fontColor(this.colorPrimary)
             .onClick(() => this.handleLogout());
         }
       }
@@ -2454,7 +2517,7 @@ struct Index {
 
       if (this.getSession()) {
         Button('我的地点')
-          .backgroundColor('#f1edff')
+          .backgroundColor(this.colorPrimaryLight)
           .fontColor(this.colorPrimary)
           .onClick(() => { this.currentPage = PageView.MyPlaces; void this.loadMyPlaces(); })
           .margin({ bottom: 12 });
