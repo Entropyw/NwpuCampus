@@ -1,33 +1,16 @@
-# NwpuCampus Server API# NwpuCampus Server API 文档
+# NwpuCampus Server API 文档
 
+本文档基于 `server/src/server.ts` 的实现，描述所有可用的 HTTP API、鉴权方式、字段说明与示例请求/响应结构。默认服务地址：
 
-
-## 8. 用户消息本文档基于 `server/src/server.ts` 的实现，描述所有可用的 HTTP API、鉴权方式、字段说明与示例请求/响应结构。默认服务地址：
-
-
-
-### GET /api/messages- Base URL: `http://121.36.80.168:8080`
-
-**描述**：获取当前用户的历史消息。
-
-> 若无法访问健康检查，请确认服务已启动且服务器安全组/防火墙已放行对应端口。
-
-**请求头**：`Authorization: Bearer <token>`
+- Base URL: `http://121.36.80.168:8080`
 
 > 全部接口均返回 JSON。除特别说明外，状态码为 200 表示成功；错误时返回 `{ error: string }`。
 
-**响应**：
+---
 
-```json---
+## 1. 通用约定
 
-{ "messages": [ { "id": "string", "userId": "string", "message": "string", "date": 1700000000000 } ] }
-
-```## 1. 通用约定
-
-
-
-> 说明：服务端消息已持久化。实际响应还会包含 `title`/`content`/`unread`/`action`/`place` 等字段，前端可按需使用。### 1.1 Content-Type
-
+### 1.1 Content-Type
 - 请求体为 JSON 时：`Content-Type: application/json`
 
 ### 1.2 认证方式
@@ -62,6 +45,7 @@
 | --- | --- | --- |
 | id | string | 用户 ID |
 | username | string | 用户名 |
+| email | string | 绑定邮箱（可选，未绑定为空字符串） |
 | isAdmin | boolean | 是否管理员 |
 
 ---
@@ -114,6 +98,159 @@
 
 **错误**：
 - 401: `Invalid credentials`
+
+---
+
+### GET /api/users
+**描述**：开发用，列出所有用户（无需登录）。
+
+**响应**：
+```json
+{ "users": [ { "id": "string", "username": "string", "isAdmin": false } ] }
+```
+
+---
+
+### POST /api/users
+**描述**：开发用，直接创建用户（无需登录）。
+
+**请求体**：
+```json
+{ "username": "string", "password": "string" }
+```
+
+**响应**：
+```json
+{ "user": { "id": "string", "username": "string", "isAdmin": false } }
+```
+
+**错误**：
+- 400: `Invalid credentials`
+- 400: `User exists`
+
+---
+
+### POST /api/pre-register
+**描述**：为尚未完成注册的账号创建占位用户并生成验证码（有效期 5 分钟），不发送邮件，返回验证码供前端/开发使用。
+
+**请求体**：
+```json
+{ "username": "string" }
+```
+
+**响应**：
+```json
+{ "ok": true, "code": "123456" }
+```
+
+**错误**：
+- 400: `username required`
+- 400: `User exists`（已设置密码的正式账号）
+
+---
+
+### POST /api/send-code
+**描述**：为已存在的账号生成验证码（有效期 5 分钟），不发送邮件，返回验证码供开发/短信渠道使用。
+
+**请求体**：
+```json
+{ "username": "string" }
+```
+
+**响应**：
+```json
+{ "ok": true, "code": "123456" }
+```
+
+**错误**：
+- 404: `User not found`
+
+---
+
+### POST /api/login-code
+**描述**：使用验证码登录。
+
+**请求体**：
+```json
+{ "username": "string", "code": "123456" }
+```
+
+**响应**：
+- 占位用户（尚未设置密码）：`{ "ok": true }`
+- 已设置密码的用户：`{ "token": "string", "user": { "id": "string", "username": "string", "isAdmin": false } }`
+
+**错误**：
+- 401: `Invalid credentials`
+- 404: `User not found`
+
+---
+
+### POST /api/email/send
+**描述**：发送邮箱验证码（用途：绑定邮箱或重置密码，5 分钟内有效）。
+
+**请求体**：
+```json
+{ "username": "string", "email": "user@example.com", "purpose": "bind" | "reset" }
+```
+
+**响应**：
+```json
+{ "ok": true, "code": "123456" }
+```
+
+**说明**：
+- 始终发送邮件，同时返回验证码便于开发环境调试。
+- `purpose=bind`：若账号已绑定且邮箱不同，返回 400。
+- `purpose=reset`：需要账号已绑定且邮箱一致，否则返回 400。
+- 验证码记录存入 `verification_codes`，5 分钟后被清理。
+
+**错误**：
+- 400: `Username and email required`
+- 400: `Email not bound to this account`
+- 400: `Account already bound to a different email`
+- 404: `User not found`
+- 500: `Failed to send mail: ...`
+
+---
+
+### POST /api/email/bind
+**描述**：使用邮箱验证码绑定账号邮箱。
+
+**请求体**：
+```json
+{ "username": "string", "email": "user@example.com", "code": "123456" }
+```
+
+**响应**：
+```json
+{ "ok": true }
+```
+
+**错误**：
+- 400: `Username, email and code required`
+- 400: `Invalid or expired code`
+- 404: `User not found`
+
+---
+
+### POST /api/password/reset
+**描述**：使用邮箱验证码重置密码。
+
+**请求体**：
+```json
+{ "username": "string", "code": "123456", "newPassword": "string" }
+```
+
+**响应**：
+```json
+{ "ok": true }
+```
+
+**错误**：
+- 400: `Username, code and newPassword required`
+- 400: `Email not bound to this account`
+- 400: `Invalid or expired code`
+- 404: `User not found`
 
 ---
 
@@ -354,6 +491,51 @@
 
 ---
 
+### POST /api/admin/send-mail
+**描述**：管理员发送验证码邮件（默认用途：绑定），并保存账号与验证码对应关系。
+
+**请求头**：`Authorization: Bearer <token>`（管理员）
+
+**请求体**：
+```json
+{ "account": "admin", "email": "user@example.com" }
+```
+
+**响应**：
+```json
+{ "ok": true, "code": "123456" }
+```
+
+**错误**：
+- 400: `Account and email required`
+- 403: `Admin only`
+- 404: `User not found`
+- 500: `Failed to send mail: ...`
+
+**行为说明**：
+- 验证码用途固定为 `bind`，有效期 5 分钟，写入 `verification_codes`，同时发送邮件。
+- 邮件内容：subject `Verification Code`，正文 `Your verification code is <code>. It expires in 5 minutes.`
+- SMTP: `smtp.126.com:465`，发件人：`ygshgzhy@126.com`
+
+### POST /api/admin/verify-code
+**描述**：验证账号与验证码是否匹配（有效期 5 分钟），成功后删除验证码记录。
+
+**请求体**：
+```json
+{ "account": "admin", "code": "123456" }
+```
+
+**响应**：
+```json
+{ "ok": true }
+```
+
+**错误**：
+- 400: `Account and code required`
+- 400: `Invalid or expired code`
+
+---
+
 ## 7. 用户偏好
 
 ### GET /api/preferences
@@ -388,7 +570,61 @@
 
 ---
 
-## 8. 错误响应格式
+## 8. 图片上传
+
+### POST /api/images
+**描述**：上传图片二进制数据，保存到服务器并返回可访问 URL（无需登录）。
+
+**请求头**：
+- `Content-Type: image/jpeg | image/png | image/webp | image/gif`
+- 可选：`X-File-Name: example.png` 或查询参数 `?filename=example.png` 用于推断扩展名。
+
+**请求体**：二进制图片流。
+
+**响应**：
+```json
+{ "id": "string", "url": "http://.../images/<id>.png", "fileName": "<id>.png" }
+```
+
+**错误**：
+- 400: `Empty file` / `Unsupported image type` / `File too large`
+
+---
+
+### POST /api/images/from-path
+**描述**：从服务器指定路径读取图片并保存（无需登录）。适合将已有文件导入上传目录。
+
+**请求体**：
+```json
+{ "path": "/abs/path/to/image.png", "contentType": "image/png", "fileName": "image.png" }
+```
+- `path` 必填，服务器可访问的文件绝对路径。
+- `contentType` 可选，未提供时按扩展名推断。
+- `fileName` 可选，仅用于扩展名推断，不会影响生成的 ID 文件名。
+
+**响应**：
+```json
+{ "id": "string", "url": "http://.../images/<id>.png", "fileName": "<id>.png" }
+```
+
+**错误**：
+- 400: `path required` / `Unsupported image type` / `File too large`
+- 404: `File not found`
+
+---
+
+### GET /images/{fileName}
+**描述**：直接获取已上传图片文件。
+
+**响应**：图片二进制流，`Content-Type` 按文件扩展名返回。
+
+**错误**：
+- 400: `Bad Request`
+- 404: `Not Found`
+
+---
+
+## 9. 错误响应格式
 
 ```json
 { "error": "string" }
@@ -396,8 +632,6 @@
 
 ---
 
-## 9. 默认管理员
+## 10. 默认管理员
 - 用户名：`admin`
 - 密码：`admin123`
-
-建议上线后立即修改 `server/data/db.json`。

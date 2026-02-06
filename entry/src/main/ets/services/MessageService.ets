@@ -60,7 +60,7 @@ export class MessageService {
   }
 
   async list(session: UserSession | null): Promise<UserMessage[]> {
-    if (!session || session.isAdmin || !this.useRemote || !this.client || !session.token) {
+    if (!session || !this.useRemote || !this.client || !session.token) {
       return [];
     }
     try {
@@ -86,7 +86,7 @@ export class MessageService {
   }
 
   async markAllRead(session: UserSession | null): Promise<boolean> {
-    if (!session || session.isAdmin || !this.useRemote || !this.client || !session.token) {
+    if (!session || !this.useRemote || !this.client || !session.token) {
       return false;
     }
     try {

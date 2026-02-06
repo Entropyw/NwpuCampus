@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "module description"
+      "value": "西工大校园行，融汇地图、定位与反馈的校园助手"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "description"
+      "value": "登陆即可浏览校内地图、保存自定义地点并参与反馈"
     },
     {
       "name": "EntryAbility_label",
-      "value": "label"
+      "value": "西工大校园行"
     },
     {
       "name": "permission_location_reason",

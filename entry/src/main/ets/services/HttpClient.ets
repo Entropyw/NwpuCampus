@@ -19,6 +19,10 @@ export class HttpRequestBody {
   sourceType?: string;
   sourcePlaceId?: string;
   message?: string;
+  email?: string;
+  code?: string;
+  purpose?: string;
+  newPassword?: string;
 }
 
 export interface HttpResponse {

@@ -2,6 +2,9 @@ import common from '@ohos.app.ability.common';
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import geoLocationManager from '@ohos.geoLocationManager';
 import promptAction from '@ohos.promptAction';
+import netHttp from '@ohos.net.http';
+import vibrator from '@ohos.vibrator';
+import textToSpeech from '@ohos.textToSpeech';
 import { MapCanvas } from '../components/MapCanvas';
 import { LongPressHandler, MapEventBus, SizeHandler, TapHandler, TransformHandler } from '../services/MapEventBus';
 import { AuthService } from '../services/AuthService';
@@ -18,6 +21,15 @@ interface PermissionRequestResult {
 
 interface AtManagerLike {
   requestPermissionsFromUser(ctx: common.UIAbilityContext, permissions: Array<string>): Promise<PermissionRequestResult | null>;
+  checkAccessToken?: (tokenId: number, permissionName: string) => number;
+}
+
+interface ApplicationInfoLike {
+  accessTokenId?: number;
+}
+
+interface UIAbilityContextLike {
+  applicationInfo?: ApplicationInfoLike;
 }
 
 // Types for photo access helper (named interfaces to satisfy arkts linter)
@@ -42,6 +54,9 @@ interface CenterOffset {
   offsetY: number;
 }
 
+type ResourceStr = string;
+declare function $r(resourceName: string): ResourceStr;
+
 // Optional NAPI photo access loader (provided by runtime on device)
 declare function requireNapi(name: string): PhotoAccessHelperModule | undefined;
 
@@ -57,6 +72,8 @@ interface RawMessageFields {
   userId?: string;
   message?: string;
   date?: number;
+  placeId?: string;
+  type?: string;
 }
 
 // ArkTS linter forbids intersection types. Use interface inheritance instead
@@ -163,6 +180,8 @@ enum PageView {
 @Component
 struct Index {
   @State myLocation: LatLon | null = null;
+  @State myLocationStatusText: string = '定位未初始化';
+  @State myLocationUpdatedAt: number = 0;
   @State zoom: number = 1;
   @State offsetX: number = 0;
   @State offsetY: number = 0;
@@ -210,6 +229,12 @@ struct Index {
   @State focusContext: string = '';
   @State focusReviewPlaceId: string = '';
   @State dynamicNavActive: boolean = false;
+
+  @State feedbackVisible: boolean = false;
+  @State feedbackPlaceId: string = '';
+  @State feedbackText: string = '';
+
+  @State adminReviewTab: 'review' | 'feedback' = 'review';
   @State placeName: string = '';
   @State placeDesc: string = '';
   @State placeImage: string = '';
@@ -227,7 +252,15 @@ struct Index {
   @State codeCooldownUntil: number = 0;
   @State selectedPoint: LatLon | null = null;
 
-  private apiBase: string = 'http://121.36.80.168:8081';
+  @State hazardWarningVisible: boolean = false;
+  @State hazardWarningText: string = '';
+
+  @State mockLocationEnabled: boolean = false;
+  @State mockLocationServerUrl: string = '';
+
+  private refreshInFlight: boolean = false;
+
+  private apiBase: string = 'http://121.36.80.168:8080';
   private osmParser: OsmParser = new OsmParser();
   private placeService: PlaceService = new PlaceService();
   private authService: AuthService = new AuthService();
@@ -239,7 +272,33 @@ struct Index {
   private endIndex: number = 1;
   private useMockLocation: boolean = false;
   private locationUpdateIntervalId: number | null = null;
-  private locationUpdateIntervalMs: number = 8000;
+  private locationUpdateIntervalMs: number = 2000;
+  private activeLocationUpdateIntervalMs: number = 0;
+
+  private locationPermissionRequested: boolean = false;
+
+  private mockSimStartAt: number = Date.now();
+  private mockSimCenter: LatLon | null = null;
+  private mockSimRadiusM: number = 120;
+  private mockSimSpeedMps: number = 1.4;
+
+  private navRecalcAt: number = 0;
+  private navRecalcLoc: LatLon | null = null;
+
+  private ttsEngine: TtsEngine | null = null;
+interface VibratorModule {
+  vibrate?: (duration: number) => void;
+}
+
+interface TtsEngine {
+  speakText?: (text: string) => void;
+  stop?: () => void;
+}
+
+interface TtsModule {
+  createTextToSpeechEngine?: () => TtsEngine;
+}
+
 
   private poiFallback: Array<MapLabel> = this.buildFallbackLabels();
   private savedFilter: PlaceFilter | null = null;
@@ -264,16 +323,16 @@ struct Index {
   private mapCanvasWidth: number = 0;
   private mapCanvasHeight: number = 0;
 
-  aboutToAppear(): void {
-  // business API moved to 8081
-  this.apiBase = 'http://121.36.80.168:8081';
+    aboutToAppear(): void {
+      // business API follows the documented base
+      this.apiBase = 'http://121.36.80.168:8080';
     this.placeService.enableRemote(this.apiBase);
     this.authService.enableRemote(this.apiBase);
     this.messageService.enableRemote(this.apiBase);
-  // email service remains at 8080
-  this.authService.enableEmailRemote('http://121.36.80.168:8080');
+      this.authService.enableEmailRemote(this.apiBase);
     this.loadMap();
-    this.initMyLocation();
+    this.locationPermissionRequested = false;
+    void this.initMyLocation();
     this.startLocationUpdates();
     // register map event handlers
     this.__mapTapHandler = new IndexTapHandler(this);
@@ -422,13 +481,35 @@ struct Index {
   private sendMyLocation(lat: number, lon: number): void {
     const loc: LatLon = { lat, lon };
     this.myLocation = loc;
+    this.myLocationUpdatedAt = Date.now();
+    const source = this.mockLocationEnabled ? '模拟定位' : '真实定位';
+    this.myLocationStatusText = `${source} 已更新: ${lat.toFixed(6)}, ${lon.toFixed(6)}`;
     this.checkHazardProximity(loc);
+    this.checkRouteHazardAhead(loc);
     this.lastLocation = loc;
-    if (this.dynamicNavActive && this.routeEnd) {
-      this.routeStart = loc;
-      this.routeStartLabel = '我的位置';
-      this.planRoute();
+    this.maybeReplanRouteWithMyLocation(loc);
+  }
+
+  private maybeReplanRouteWithMyLocation(loc: LatLon): void {
+    if (!this.dynamicNavActive || !this.routeEnd) {
+      return;
     }
+    const now = Date.now();
+    if (now - this.navRecalcAt < 1500) {
+      return;
+    }
+    if (this.navRecalcLoc) {
+      const moved = this.distanceMeters(loc, this.navRecalcLoc);
+      if (moved < 1.5) {
+        return;
+      }
+    }
+    this.navRecalcAt = now;
+    this.navRecalcLoc = loc;
+
+    this.routeStart = loc;
+    this.routeStartLabel = '我的位置';
+    this.planRoute();
   }
 
   private getCampusCenter(): LatLon {
@@ -445,27 +526,64 @@ struct Index {
   }
 
   private generateMockLocation(): LatLon {
-    const center = this.getCampusCenter();
-    const radiusMeters = 500;
-    const angle = Math.random() * Math.PI * 2;
-    const dist = Math.sqrt(Math.random()) * radiusMeters;
+    if (!this.mockSimCenter) {
+      this.mockSimCenter = this.getCampusCenter();
+      this.mockSimStartAt = Date.now();
+    }
+    const center = this.mockSimCenter;
+    const radius = this.mockSimRadiusM;
+    const speed = this.mockSimSpeedMps;
+    const circumference = 2 * Math.PI * Math.max(1, radius);
+    const periodMs = (circumference / Math.max(0.1, speed)) * 1000;
+    const phase = ((Date.now() - this.mockSimStartAt) % periodMs) / periodMs;
+    const theta = phase * 2 * Math.PI;
+
+    const dNorth = Math.cos(theta) * radius;
+    const dEast = Math.sin(theta) * radius;
     const metersPerDegLat = 111320;
     const metersPerDegLon = metersPerDegLat * Math.cos(center.lat * Math.PI / 180);
-    const deltaLat = (Math.cos(angle) * dist) / metersPerDegLat;
-    const deltaLon = (Math.sin(angle) * dist) / metersPerDegLon;
-    const mockLoc: LatLon = { lat: center.lat + deltaLat, lon: center.lon + deltaLon };
-    return mockLoc;
+    const deltaLat = dNorth / metersPerDegLat;
+    const deltaLon = dEast / metersPerDegLon;
+    return { lat: center.lat + deltaLat, lon: center.lon + deltaLon };
   }
 
-  private async requestLocationPermission(): Promise<boolean> {
+  private hasLocationPermission(): boolean {
     try {
+      const context = this.getHostContext() as unknown as UIAbilityContextLike;
+      const tokenId = context && context.applicationInfo ? context.applicationInfo.accessTokenId : undefined;
+      if (typeof tokenId !== 'number') {
+        return false;
+      }
+      const atManager = abilityAccessCtrl.createAtManager();
+      const checker = (atManager as AtManagerLike).checkAccessToken;
+      if (typeof checker !== 'function') {
+        return false;
+      }
+      const status = checker(tokenId, 'ohos.permission.LOCATION');
+      return status === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  private async ensureLocationPermission(): Promise<boolean> {
+    try {
+      if (this.hasLocationPermission()) {
+        return true;
+      }
+      // Avoid repeatedly popping permission dialogs during polling.
+      if (this.locationPermissionRequested) {
+        return false;
+      }
+      this.locationPermissionRequested = true;
+
       const context = this.getHostContext();
       const atManager = abilityAccessCtrl.createAtManager();
-  // Use explicit types and a small adapter interface so we don't rely on any/unknown.
-  const permissions: Array<string> = ['ohos.permission.LOCATION', 'ohos.permission.APPROXIMATELY_LOCATION'];
-  const rawResult = await (atManager as AtManagerLike).requestPermissionsFromUser(context, permissions);
-  const result: PermissionRequestResult | null = rawResult as PermissionRequestResult | null;
-  const authResults: Array<number> = result && result.authResults ? result.authResults : [];
+      // Request minimal permission to avoid SDK-compat issues across versions.
+      const permissions: Array<string> = ['ohos.permission.LOCATION'];
+      const rawResult = await (atManager as AtManagerLike).requestPermissionsFromUser(context, permissions);
+      const result: PermissionRequestResult | null = rawResult as PermissionRequestResult | null;
+      const authResults: Array<number> = result && result.authResults ? result.authResults : [];
       if (authResults.length === 0) {
         return false;
       }
@@ -499,19 +617,28 @@ struct Index {
   }
 
   private async initMyLocation(): Promise<void> {
-    if (this.useMockLocation) {
-      const mock = this.generateMockLocation();
-      this.sendMyLocation(mock.lat, mock.lon);
+    if (this.mockLocationEnabled) {
+      this.myLocationStatusText = '正在获取模拟定位...';
+      const mock = await this.getMockLocationOnce();
+      if (mock) {
+        this.sendMyLocation(mock.lat, mock.lon);
+      } else {
+        this.myLocationStatusText = '模拟定位获取失败（服务无响应或返回无效数据）';
+      }
       return;
     }
-    const granted = await this.requestLocationPermission();
+    this.myLocationStatusText = '正在获取真实定位...';
+    const granted = await this.ensureLocationPermission();
     if (!granted) {
       console.warn('定位权限未授予，无法获取真实位置');
+      this.myLocationStatusText = '定位权限未授予（请在系统设置中允许定位权限）';
       return;
     }
     const real = await this.getRealLocation();
     if (real) {
       this.sendMyLocation(real.latitude, real.longitude);
+    } else {
+      this.myLocationStatusText = '真实定位获取失败（请确认已打开系统定位开关/GPS）';
     }
   }
 
@@ -522,41 +649,53 @@ struct Index {
    * differs across platform versions.
    */
   private startLocationUpdates(intervalMs?: number): void {
-    if (this.locationUpdateIntervalId != null) {
-      // already running
-      return;
-    }
     const ms = intervalMs && intervalMs > 0 ? intervalMs : this.locationUpdateIntervalMs;
+    if (this.locationUpdateIntervalId != null) {
+      // already running; restart if interval differs
+      if (this.activeLocationUpdateIntervalMs !== ms) {
+        this.stopLocationUpdates();
+      } else {
+        return;
+      }
+    }
 
-    if (this.useMockLocation) {
-      const sendMock = (): void => {
+    this.activeLocationUpdateIntervalMs = ms;
+
+    if (this.mockLocationEnabled) {
+      const pollMock = async (): Promise<void> => {
         try {
-          const mock = this.generateMockLocation();
-          this.sendMyLocation(mock.lat, mock.lon);
+          const mock = await this.getMockLocationOnce();
+          if (mock) {
+            this.sendMyLocation(mock.lat, mock.lon);
+          }
         } catch (e) {
-          console.error('发送模拟位置失败', e);
+          console.error('轮询模拟位置失败', e);
         }
       };
-      sendMock();
-      this.locationUpdateIntervalId = Number(setInterval(() => sendMock(), ms));
+      pollMock();
+      this.locationUpdateIntervalId = Number(setInterval(() => { void pollMock(); }, ms));
       return;
     }
 
     // Real device: poll getCurrentLocation with async wrapper
     const pollOnce = async (): Promise<void> => {
       try {
-        const granted = await this.requestLocationPermission();
+        const granted = this.hasLocationPermission() ? true : await this.ensureLocationPermission();
         if (!granted) {
           console.warn('定位权限未授予，停止定位更新');
+          this.myLocationStatusText = '定位权限未授予，已停止自动定位更新';
           this.stopLocationUpdates();
           return;
         }
         const real = await this.getRealLocation();
         if (real) {
           this.sendMyLocation(real.latitude, real.longitude);
+        } else {
+          this.myLocationStatusText = '真实定位获取失败（轮询中）';
         }
       } catch (e) {
         console.error('轮询位置失败', e);
+        this.myLocationStatusText = `轮询位置失败: ${String(e)}`;
       }
     };
 
@@ -573,6 +712,136 @@ struct Index {
         // ignore
       }
       this.locationUpdateIntervalId = null;
+    }
+    this.activeLocationUpdateIntervalMs = 0;
+  }
+
+  private async getMockLocationOnce(): Promise<LatLon | null> {
+    const url = (this.mockLocationServerUrl || '').trim();
+    if (!url) {
+      return this.generateMockLocation();
+    }
+    try {
+      const req = netHttp.createHttp();
+      const options: netHttp.HttpRequestOptions = {
+        method: netHttp.RequestMethod.GET,
+        connectTimeout: 4000,
+        readTimeout: 4000
+      };
+      const resp = await req.request(url, options);
+      const raw = resp && resp.result ? String(resp.result) : '';
+      // Expect {lat, lon} or {latitude, longitude}
+      const parsed = raw ? (JSON.parse(raw) as Record<string, number>) : null;
+      const lat = parsed ? (Number(parsed.lat) || Number(parsed.latitude) || 0) : 0;
+      const lon = parsed ? (Number(parsed.lon) || Number(parsed.longitude) || 0) : 0;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) {
+        return null;
+      }
+      return { lat, lon };
+    } catch (e) {
+      // Fallback to local movement simulation if the external simulator is unreachable.
+      return this.generateMockLocation();
+    }
+  }
+
+  private showHazardWarning(text: string): void {
+    this.hazardWarningText = text;
+    this.hazardWarningVisible = true;
+    // Auto hide after 3 seconds
+    setTimeout(() => {
+      this.hazardWarningVisible = false;
+      this.hazardWarningText = '';
+    }, 3000);
+  }
+
+  private checkRouteHazardAhead(current: LatLon): void {
+    if (!this.dynamicNavActive || !this.routeVisible || !this.route || !this.route.path || this.route.path.length < 2) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastHazardAlertAt < 5000) {
+      return;
+    }
+
+    // Find nearest route point index to current position.
+    let currentIdx = 0;
+    let best = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < this.route.path.length; i++) {
+      const d = this.distanceMeters(current, this.route.path[i]);
+      if (d < best) {
+        best = d;
+        currentIdx = i;
+      }
+    }
+
+    for (const place of this.places) {
+      const isHazard = place.type === 'water' || place.type === 'danger' || place.type === 'slippery';
+      if (!isHazard) {
+        continue;
+      }
+      // Find nearest route point index to hazard.
+      let hazardIdx = 0;
+      let hazardBest = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < this.route.path.length; i++) {
+        const d = this.distanceMeters({ lat: place.lat, lon: place.lon }, this.route.path[i]);
+        if (d < hazardBest) {
+          hazardBest = d;
+          hazardIdx = i;
+        }
+      }
+      if (hazardIdx <= currentIdx) {
+        continue;
+      }
+      // Must be close to route
+      if (hazardBest > 8) {
+        continue;
+      }
+      // Compute along-route distance from currentIdx to hazardIdx
+      let along = 0;
+      for (let i = currentIdx; i < hazardIdx; i++) {
+        along += this.distanceMeters(this.route.path[i], this.route.path[i + 1]);
+        if (along > 6) {
+          break;
+        }
+      }
+      if (along <= 5.0) {
+        this.lastHazardAlertAt = now;
+        const msg = place.type === 'water'
+          ? '前方5米内有水雷，请注意脚下'
+          : '前方5米内有危险地带，请注意安全';
+        this.showHazardWarning(msg);
+        promptAction.showToast({ message: msg, duration: 2000 });
+        // Best-effort hooks: vibration + voice (will no-op if device lacks capability)
+        void this.tryVibrateAndSpeak(msg);
+        return;
+      }
+    }
+  }
+
+  private async tryVibrateAndSpeak(text: string): Promise<void> {
+    // Vibration / TTS are device-dependent; keep best-effort and never crash.
+    try {
+      const vib = vibrator as VibratorModule;
+      if (vib.vibrate) {
+        vib.vibrate(250);
+      }
+    } catch (e) {
+      // ignore
+    }
+    try {
+      if (!this.ttsEngine) {
+        const tts = textToSpeech as TtsModule;
+        if (tts.createTextToSpeechEngine) {
+          this.ttsEngine = tts.createTextToSpeechEngine();
+        }
+      }
+      if (this.ttsEngine && this.ttsEngine.speakText) {
+        this.ttsEngine.speakText(text);
+      } else {
+        console.info('TTS fallback:', text);
+      }
+    } catch (e) {
+      // ignore
     }
   }
 
@@ -616,6 +885,15 @@ struct Index {
     }
     this.route = nextRoute;
     this.routeVisible = true;
+
+    // When navigation is active, keep the camera focused on the start point.
+    if (this.dynamicNavActive) {
+      const nextZoom = clampZoom(2.2);
+      const offsets = this.computeCenterOffsets(startResolved.lat, startResolved.lon, nextZoom);
+      this.zoom = nextZoom;
+      this.offsetX = offsets.offsetX;
+      this.offsetY = offsets.offsetY;
+    }
     return true;
   }
 
@@ -635,14 +913,22 @@ struct Index {
       this.routeStart = point;
       this.routeStartLabel = '地图点';
       this.pickMode = MapPickMode.None;
-      this.invalidateRoute();
+      if (this.routeStart && this.routeEnd) {
+        this.planRoute();
+      } else {
+        this.invalidateRoute();
+      }
       return;
     }
     if (this.pickMode === MapPickMode.End) {
       this.routeEnd = point;
       this.routeEndLabel = '地图点';
       this.pickMode = MapPickMode.None;
-      this.invalidateRoute();
+      if (this.routeStart && this.routeEnd) {
+        this.planRoute();
+      } else {
+        this.invalidateRoute();
+      }
       return;
     }
     const place = this.findNearestPlace(point);
@@ -700,11 +986,24 @@ struct Index {
     return offsets;
   }
 
+  private centerMapOnMyLocation(): void {
+    if (!this.myLocation) {
+      return;
+    }
+    const nextZoom = clampZoom(this.zoom < 1.6 ? 1.8 : this.zoom);
+    const offsets = this.computeCenterOffsets(this.myLocation.lat, this.myLocation.lon, nextZoom);
+    this.zoom = nextZoom;
+    this.offsetX = offsets.offsetX;
+    this.offsetY = offsets.offsetY;
+    this.currentPage = PageView.Map;
+  }
+
   private focusMapOnPlace(place: Place, returnPage: PageView, context: string): void {
     this.focusPlace = place;
     this.focusReturnPage = returnPage;
     this.focusContext = context;
     this.focusNavVisible = true;
+    // Viewing a place doesn't automatically start navigation.
     this.dynamicNavActive = false;
     const nextZoom = clampZoom(1.8);
     const offsets = this.computeCenterOffsets(place.lat, place.lon, nextZoom);
@@ -714,16 +1013,28 @@ struct Index {
     this.currentPage = PageView.Map;
   }
 
-  private exitFocusView(): void {
-    if (this.focusReturnPage != null) {
-      this.currentPage = this.focusReturnPage;
-    }
+  private clearFocusViewState(): void {
     this.focusPlace = null;
     this.focusReturnPage = null;
     this.focusContext = '';
     this.focusReviewPlaceId = '';
     this.focusNavVisible = false;
-    this.dynamicNavActive = false;
+  }
+
+  // “返回”：回到进入查看位置前的页面
+  private exitFocusView(): void {
+    if (this.focusReturnPage != null) {
+      this.currentPage = this.focusReturnPage;
+    } else {
+      this.currentPage = PageView.Map;
+    }
+    this.clearFocusViewState();
+  }
+
+  // “取消”：留在地图主页，仅关闭查看位置浮层
+  private cancelFocusView(): void {
+    this.currentPage = PageView.Map;
+    this.clearFocusViewState();
   }
 
   private toggleFocusNavOptions(): void {
@@ -735,20 +1046,27 @@ struct Index {
       return;
     }
     const dest: LatLon = { lat: this.focusPlace.lat, lon: this.focusPlace.lon };
-    const start: LatLon | null = this.myLocation ? { lat: this.myLocation.lat, lon: this.myLocation.lon } : this.routeStart;
-    if (start) {
-      this.routeStart = start;
-      this.routeEnd = dest;
-      this.routeStartLabel = '我的位置';
-      this.routeEndLabel = this.focusPlace.name;
-      this.planRoute();
-    } else {
-      this.routeEnd = dest;
-      this.routeEndLabel = this.focusPlace.name;
-      this.invalidateRoute();
-    }
+    const start: LatLon = this.myLocation
+      ? { lat: this.myLocation.lat, lon: this.myLocation.lon }
+      : (this.routeStart || this.selectedPoint || this.getCampusCenter());
+
+    this.routeStart = start;
+    this.routeEnd = dest;
+    this.routeStartLabel = this.myLocation ? '我的位置' : (this.routeStartLabel || '起点');
+    this.routeEndLabel = this.focusPlace.name;
+
     this.dynamicNavActive = true;
-    this.focusNavVisible = false;
+    this.invalidateRoute();
+    this.planRoute();
+    // Make navigation real-time: poll location more frequently while navigating.
+    this.startLocationUpdates(1000);
+    this.cancelFocusView();
+  }
+
+  private stopNavigation(): void {
+    this.dynamicNavActive = false;
+    this.invalidateRoute();
+    this.startLocationUpdates(this.locationUpdateIntervalMs);
   }
 
   private normalizeText(text: string): string {
@@ -878,6 +1196,10 @@ struct Index {
     return this.placeService.isPlaceHidden(placeId, this.getSession());
   }
 
+  private isPlaceFavorite(placeId: string): boolean {
+    return this.placeService.isPlaceFavorite(placeId, this.getSession());
+  }
+
   private buildLocationOptions(): Array<LocationOption> {
     const list: Array<LocationOption> = [];
     for (const label of this.getPoiCandidates()) {
@@ -908,7 +1230,11 @@ struct Index {
     }
     this.currentPage = PageView.Map;
     this.pickMode = MapPickMode.None;
-    this.invalidateRoute();
+    if (this.routeStart && this.routeEnd) {
+      this.planRoute();
+    } else {
+      this.invalidateRoute();
+    }
   }
 
   private toggleNightMode(): void {
@@ -940,7 +1266,7 @@ struct Index {
       }
       this.hazardMode = false;
     }
-    this.refreshPlaces();
+    void this.refreshPlaces();
     this.invalidateRoute();
   }
 
@@ -958,10 +1284,49 @@ struct Index {
   }
 
   private async refreshPlaces(): Promise<void> {
-    const session = this.authService.getSession();
-    this.places = await this.placeService.list(this.filter, session);
-    this.pendingPlaces = await this.placeService.listPending(session);
-    this.updateHotPlaces();
+    if (this.refreshInFlight) {
+      return;
+    }
+    this.refreshInFlight = true;
+    try {
+      const session = this.authService.getSession();
+
+      // Apply the "re-enter page" behavior: clear UI selection and rebuild place cache
+      // so both auto/manual refresh reflect server changes immediately.
+      this.tapActionVisible = false;
+      this.tapPlace = null;
+      this.tapLocation = null;
+      this.focusPlace = null;
+      if (this.labels && this.labels.length > 0) {
+        this.placeService.hardReseedSystemPlaces(this.labels);
+      }
+
+      // Force a remote sync first so manual/auto refresh always pulls latest.
+      // If remote fails, still fall back to cached/local but show the error.
+      await this.placeService.syncRemote(session);
+      const syncErr = this.placeService.getLastError();
+      if (syncErr) {
+        promptAction.showToast({ message: syncErr, duration: 1500 });
+      }
+      this.places = await this.placeService.list(this.filter, session);
+      this.pendingPlaces = await this.placeService.listPending(session);
+      this.updateHotPlaces();
+    } finally {
+      this.refreshInFlight = false;
+    }
+  }
+
+  private getVoteValue(placeId: string): number {
+    const session = this.getSession();
+    return this.placeService.getMyVoteValue(placeId, session);
+  }
+
+  private voteButtonLabel(placeId: string, delta: number): string {
+    const value = this.getVoteValue(placeId);
+    if (delta === 1) {
+      return value === 1 ? '取消点赞' : '👍 赞';
+    }
+    return value === -1 ? '取消踩' : '👎 踩';
   }
 
   private async loadMyPlaces(): Promise<void> {
@@ -970,6 +1335,8 @@ struct Index {
       this.myPlaces = [];
       return;
     }
+    // Ensure we have latest places + preferences (hidden/favorite) from server.
+    await this.refreshPlaces();
     const list = await this.placeService.listMyPlaces(session);
     this.myPlaces = list;
   }
@@ -1002,16 +1369,11 @@ struct Index {
   }
 
   private async handleRegister(): Promise<void> {
-    if (!this.registerEmail || !this.registerCode) {
-      this.authError = '请填写邮箱和验证码';
+    if (!this.username || !this.password) {
+      this.authError = '请填写账号和密码';
       return;
     }
-    const verified = await this.authService.verifyEmailCode(this.username, this.registerCode);
-    if (!verified) {
-      this.authError = this.authService.getLastError() || '邮箱验证失败';
-      return;
-    }
-    const session = await this.authService.register(this.username, this.password, this.registerEmail);
+    const session = await this.authService.register(this.username, this.password);
     if (session) {
       this.authError = '';
       this.updateSessionStatus(session);
@@ -1040,7 +1402,7 @@ struct Index {
       promptAction.showToast({ message: '请输入账号和邮箱', duration: 1500 });
       return;
     }
-    const ok = await this.authService.sendEmailCode(this.username, this.registerEmail);
+    const ok = await this.authService.sendEmailCode(this.username, this.registerEmail, 'bind');
     if (ok) {
       this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
@@ -1064,7 +1426,7 @@ struct Index {
       promptAction.showToast({ message: '管理员账户不支持找回密码', duration: 1500 });
       return;
     }
-    const ok = await this.authService.sendEmailCode(this.username, this.resetEmail);
+    const ok = await this.authService.sendEmailCode(this.username, this.resetEmail, 'reset');
     if (ok) {
       this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
@@ -1085,7 +1447,7 @@ struct Index {
       promptAction.showToast({ message: '请输入绑定邮箱', duration: 1500 });
       return;
     }
-    const ok = await this.authService.sendEmailCode(session.username, this.bindEmail);
+    const ok = await this.authService.sendEmailCode(session.username, this.bindEmail, 'bind');
     if (ok) {
       this.codeCooldownUntil = Date.now() + 30000;
       promptAction.showToast({ message: '验证码已发送', duration: 1200 });
@@ -1101,11 +1463,6 @@ struct Index {
     }
     if (!this.username || !this.resetEmail || !this.resetCode || !this.resetNewPassword) {
       this.authError = '请填写完整的找回信息';
-      return;
-    }
-    const verified = await this.authService.verifyEmailCode(this.username, this.resetCode);
-    if (!verified) {
-      this.authError = this.authService.getLastError() || '验证码验证失败';
       return;
     }
     const ok = await this.authService.resetPassword(this.username, this.resetCode, this.resetNewPassword);
@@ -1124,13 +1481,26 @@ struct Index {
       promptAction.showToast({ message: '请输入邮箱和验证码', duration: 1500 });
       return;
     }
-    const verified = await this.authService.verifyEmailCode(session.username, this.bindCode);
-    if (!verified) {
-      promptAction.showToast({ message: this.authService.getLastError() || '验证失败', duration: 1500 });
+    const ok = await this.authService.bindEmail(session.username, this.bindEmail, this.bindCode);
+    if (!ok) {
+      promptAction.showToast({ message: this.authService.getLastError() || '绑定失败', duration: 1500 });
       return;
     }
     this.authService.setSessionEmail(this.bindEmail, false);
+    // 同步本地状态，保证 UI 立即刷新且找回密码使用最新邮箱
+    const refreshed = this.authService.getSession();
+    if (refreshed) {
+      const refreshedSession: UserSession = {
+        token: refreshed.token,
+        username: refreshed.username,
+        isAdmin: refreshed.isAdmin,
+        email: this.bindEmail,
+        requireEmailBind: false
+      };
+      this.updateSessionStatus(refreshedSession);
+    }
     this.bindingRequired = false;
+    this.resetEmail = this.bindEmail;
     promptAction.showToast({ message: '邮箱绑定成功', duration: 1200 });
     this.currentPage = PageView.Profile;
   }
@@ -1174,6 +1544,13 @@ struct Index {
     }
     const point = this.selectedPoint || this.myLocation || this.getCampusCenter();
     const isAdmin = session ? session.isAdmin : false;
+
+    // Admin-created places are treated as system places (blue) and are visible immediately.
+    const isAdminAddingNew = isAdmin && !this.editingPlaceId && !this.editingSourceKey;
+    if (isAdminAddingNew) {
+      this.editingSourceType = 'system';
+    }
+
     if (this.editingPlaceId) {
       const status = publish ? (isAdmin ? 'approved' : 'approved') : 'private';
       await this.placeService.updatePlace(this.editingPlaceId, {
@@ -1185,17 +1562,26 @@ struct Index {
         status
       }, session);
     } else {
-      const status = publish
-        ? (isAdmin && this.editingSourceType === 'system' ? 'pending' : (isAdmin ? 'approved' : 'private'))
-        : 'private';
+      const computedSourceType = this.editingSourceType;
+      const shouldAutoApprove = isAdmin && computedSourceType === 'system' && !this.editingSourceKey;
+      const status = shouldAutoApprove
+        ? 'approved'
+        : (publish
+          ? (isAdmin && computedSourceType === 'system' ? 'pending' : (isAdmin ? 'approved' : 'private'))
+          : 'private');
+
+      let sourceKeyValue: string = this.editingSourceKey;
+      if (!sourceKeyValue && computedSourceType === 'system') {
+        sourceKeyValue = this.placeService.makeSystemSourceKey(this.placeName || '系统地点', point.lat, point.lon);
+      }
       const input: SaveDraftInput = {
         name: this.placeName,
         description: this.placeDesc,
         type: this.placeType,
         imageUrl: this.placeImage,
         point,
-        sourceKey: this.editingSourceKey || undefined,
-        sourceType: this.editingSourceType || undefined,
+        sourceKey: sourceKeyValue || undefined,
+        sourceType: computedSourceType || undefined,
         sourcePlaceId: this.editingSourcePlaceId || undefined,
         status
       };
@@ -1283,27 +1669,12 @@ struct Index {
 
   private async handleDelete(placeId: string): Promise<void> {
     const session = this.authService.getSession();
-    const target = this.findPlaceById(placeId);
-    const ownerName = target ? this.getPlaceOwnerName(target) : '';
-    const snapshot = target ? this.buildMessageSnapshot(target) : null;
     const ok = await this.placeService.delete(placeId, session);
     if (!ok) {
-      promptAction.showToast({ message: '删除失败，请检查权限或网络', duration: 1500 });
+      promptAction.showToast({ message: this.placeService.getLastError() || '删除失败，请检查权限或网络', duration: 1500 });
       return;
     }
     await this.refreshPlaces();
-    if (session && session.isAdmin && ownerName && ownerName !== session.username && snapshot) {
-      await this.pushMessage(ownerName, {
-        id: `${ownerName}-${Date.now()}-delete`,
-        username: ownerName,
-        title: '推荐地点已被管理员删除',
-        content: `你推荐的地点「${snapshot.name}」已被管理员删除，可重新提交审核。`,
-        createdAt: Date.now(),
-        unread: true,
-        action: 'resubmit',
-        place: snapshot
-      });
-    }
   }
 
   private async handleToggleHidden(placeId: string, hidden: boolean): Promise<void> {
@@ -1312,30 +1683,39 @@ struct Index {
       promptAction.showToast({ message: '请先登录再隐藏地点', duration: 1500 });
       return;
     }
-    await this.placeService.toggleHidden(placeId, hidden, session);
+    const ok = await this.placeService.toggleHidden(placeId, hidden, session);
+    if (!ok) {
+      promptAction.showToast({ message: this.placeService.getLastError() || '操作失败，请检查网络或登录状态', duration: 1500 });
+    }
+    await this.refreshPlaces();
+  }
+
+  private async handleToggleFavorite(placeId: string, favorite: boolean): Promise<void> {
+    const session = this.authService.getSession();
+    if (!session) {
+      promptAction.showToast({ message: '请先登录再收藏地点', duration: 1500 });
+      return;
+    }
+    const ok = await this.placeService.toggleFavorite(placeId, favorite, session);
+    if (!ok) {
+      promptAction.showToast({ message: this.placeService.getLastError() || '操作失败，请检查网络或登录状态', duration: 1500 });
+    }
     await this.refreshPlaces();
   }
 
   private async handleVote(placeId: string, delta: number): Promise<void> {
     const session = this.authService.getSession();
-    if (this.placeService.hasVoted(placeId, session)) {
-      promptAction.showToast({ message: '每个账号只能点赞/踩一次', duration: 1200 });
+    if (!session) {
+      promptAction.showToast({ message: '请先登录再点赞/踩', duration: 1500 });
       return;
     }
-    await this.placeService.vote(placeId, delta, session);
-    await this.refreshPlaces();
-    if (this.tapPlace && this.tapPlace.id === placeId) {
-      const refreshed = this.findPlaceById(placeId);
-      if (refreshed) {
-        this.tapPlace = refreshed;
-      }
+    const ok = await this.placeService.vote(placeId, delta, session);
+    if (!ok) {
+      promptAction.showToast({ message: this.placeService.getLastError() || '点赞失败，请检查网络或权限', duration: 1500 });
+      return;
     }
-    if (this.detailPlace && this.detailPlace.id === placeId) {
-      const refreshed = this.findPlaceById(placeId);
-      if (refreshed) {
-        this.detailPlace = refreshed;
-      }
-    }
+    this.patchUiPlace(placeId);
+    this.updateHotPlaces();
   }
 
   private async handleFeedback(placeId: string): Promise<void> {
@@ -1344,49 +1724,52 @@ struct Index {
       promptAction.showToast({ message: '请先登录再提交反馈', duration: 1500 });
       return;
     }
-    const ok = await this.placeService.reportFeedback(placeId, '地点信息有误，请管理员核实', session);
-    if (ok) {
-      promptAction.showToast({ message: '已提交反馈', duration: 1500 });
+    this.feedbackPlaceId = placeId;
+    this.feedbackText = '';
+    this.feedbackVisible = true;
+  }
+
+  private closeFeedbackDialog(): void {
+    this.feedbackVisible = false;
+    this.feedbackPlaceId = '';
+    this.feedbackText = '';
+  }
+
+  private async submitFeedback(): Promise<void> {
+    const session = this.getSession();
+    if (!session) {
+      promptAction.showToast({ message: '请先登录再提交反馈', duration: 1500 });
+      return;
     }
+    const msg = (this.feedbackText || '').trim();
+    if (!msg) {
+      promptAction.showToast({ message: '请输入反馈内容', duration: 1500 });
+      return;
+    }
+    const placeId = this.feedbackPlaceId;
+    if (!placeId) {
+      promptAction.showToast({ message: '反馈对象为空', duration: 1500 });
+      return;
+    }
+    const ok = await this.placeService.reportFeedback(placeId, msg, session);
+    if (!ok) {
+      promptAction.showToast({ message: this.placeService.getLastError() || '提交失败，请检查网络或权限', duration: 1700 });
+      return;
+    }
+    this.closeFeedbackDialog();
+    promptAction.showToast({ message: '已提交反馈', duration: 1500 });
   }
 
   private async handleApprove(placeId: string): Promise<void> {
     const session = this.authService.getSession();
-    const target = this.findPlaceById(placeId);
-    const ownerName = target ? this.getPlaceOwnerName(target) : '';
     await this.placeService.approve(placeId, session);
     await this.refreshPlaces();
-    if (session && session.isAdmin && ownerName && ownerName !== session.username) {
-      await this.pushMessage(ownerName, {
-        id: `${ownerName}-${Date.now()}-approve`,
-        username: ownerName,
-        title: '推荐地点审核通过',
-        content: `恭喜！你推荐的地点「${target ? target.name : ''}」已通过审核。`,
-        createdAt: Date.now(),
-        unread: true
-      });
-    }
   }
 
   private async handleReject(placeId: string): Promise<void> {
     const session = this.authService.getSession();
-    const target = this.findPlaceById(placeId);
-    const ownerName = target ? this.getPlaceOwnerName(target) : '';
-    const snapshot = target ? this.buildMessageSnapshot(target) : null;
     await this.placeService.reject(placeId, session);
     await this.refreshPlaces();
-    if (session && session.isAdmin && ownerName && ownerName !== session.username && snapshot) {
-      await this.pushMessage(ownerName, {
-        id: `${ownerName}-${Date.now()}-reject`,
-        username: ownerName,
-        title: '推荐地点未通过审核',
-        content: `很遗憾，你推荐的地点「${snapshot.name}」未通过审核，可修改后重新提交。`,
-        createdAt: Date.now(),
-        unread: true,
-        action: 'resubmit',
-        place: snapshot
-      });
-    }
   }
 
   private updateFilter(partial: FilterUpdate): void {
@@ -1504,7 +1887,7 @@ struct Index {
   }
 
   private async loadMessagesForSession(session: UserSession | null): Promise<void> {
-    if (!session || session.isAdmin) {
+    if (!session) {
       this.messages = [];
       this.unreadCount = 0;
       this.showMessages = false;
@@ -1520,9 +1903,25 @@ struct Index {
         : (typeof raw.date === 'number' ? raw.date : Date.now());
       const baseUnread = msg.unread === undefined ? true : msg.unread;
       const unread = baseUnread && createdAt > readAt;
-      const title = msg.title || '消息提醒';
+      const type = raw.type || '';
+      const title = msg.title || (type === 'feedback'
+        ? '地点反馈'
+        : (type === 'approve'
+          ? '审核通过'
+          : (type === 'reject'
+            ? '审核未通过'
+            : (type === 'delete'
+              ? '地点已删除'
+              : '消息提醒'))));
       const content = msg.content || raw.message || '';
       const username = msg.username || raw.userId || '';
+      let placeSnapshot = msg.place;
+      if (!placeSnapshot && raw.placeId) {
+        const found = this.findPlaceById(String(raw.placeId));
+        if (found) {
+          placeSnapshot = this.buildMessageSnapshot(found);
+        }
+      }
       normalized.push({
         id: msg.id,
         username,
@@ -1531,7 +1930,7 @@ struct Index {
         createdAt,
         unread,
         action: msg.action,
-        place: msg.place
+        place: placeSnapshot
       });
     });
     const limited: Array<UserMessage> = [];
@@ -1540,7 +1939,7 @@ struct Index {
       limited.push(normalized[i]);
     }
     this.messages = limited;
-    this.unreadCount = normalized.filter((msg) => msg.unread).length;
+    this.unreadCount = session.isAdmin ? 0 : normalized.filter((msg) => msg.unread).length;
   }
 
   private async pushMessage(username: string, message: UserMessage): Promise<void> {
@@ -1620,6 +2019,46 @@ struct Index {
     return pending || null;
   }
 
+  private findCachedPlaceByIdOrSourceKey(placeId: string): Place | null {
+    const cached = this.placeService.getCachedPlaces();
+    const direct = cached.find((p) => p.id === placeId);
+    if (direct) {
+      return direct;
+    }
+    const current = this.findPlaceById(placeId);
+    const sourceKey = current ? (current.sourceKey || '') : '';
+    if (sourceKey) {
+      const byKey = cached.find((p) => (p.sourceType === 'system' || p.sourceKey) && p.sourceKey === sourceKey);
+      return byKey || null;
+    }
+    return null;
+  }
+
+  private patchUiPlace(placeId: string): void {
+    const updated = this.findCachedPlaceByIdOrSourceKey(placeId);
+    if (!updated) {
+      return;
+    }
+    const sourceKey = updated.sourceKey || '';
+    const match = (p: Place): boolean => {
+      if (p.id === placeId || p.id === updated.id) {
+        return true;
+      }
+      return !!sourceKey && p.sourceKey === sourceKey;
+    };
+
+    this.places = this.places.map((p) => match(p) ? updated : p);
+    this.pendingPlaces = this.pendingPlaces.map((p) => match(p) ? updated : p);
+    this.myPlaces = this.myPlaces.map((p) => match(p) ? updated : p);
+    this.hotPlaces = this.hotPlaces.map((p) => match(p) ? updated : p);
+    if (this.tapPlace && match(this.tapPlace)) {
+      this.tapPlace = updated;
+    }
+    if (this.detailPlace && match(this.detailPlace)) {
+      this.detailPlace = updated;
+    }
+  }
+
   private getPlaceOwnerName(place: Place): string {
     if (place.ownerName) {
       return place.ownerName;
@@ -1655,7 +2094,7 @@ struct Index {
   }
 
   private getAdminSystemPlaces(): Array<Place> {
-    return this.getAdminAllPlaces().filter((place) => !place.ownerId);
+    return this.getAdminAllPlaces().filter((place) => place.sourceType === 'system' || !place.ownerId);
   }
 
   private getAdminDraftPlaces(): Array<Place> {
@@ -1694,6 +2133,10 @@ struct Index {
     }
     const list = this.myPlaces.slice();
     switch (this.myPlacesTab) {
+      case 'favorite':
+        return this.getFavoritePlacesFromCache();
+      case 'hidden':
+        return this.getHiddenPlacesFromCache();
       case 'pending':
         return list.filter((p) => p.status === 'pending');
       case 'approved':
@@ -1701,6 +2144,52 @@ struct Index {
       default:
         return list;
     }
+  }
+
+  private getKnownPlacesMap(): Map<string, Place> {
+    const map = new Map<string, Place>();
+    const cached = this.placeService.getCachedPlaces();
+    for (const p of cached) {
+      map.set(p.id, p);
+    }
+    for (const p of this.myPlaces) {
+      map.set(p.id, p);
+    }
+    return map;
+  }
+
+  private getFavoritePlacesFromCache(): Array<Place> {
+    const session = this.getSession();
+    if (!session) {
+      return [];
+    }
+    const ids = this.placeService.getFavoritePlaceIds(session);
+    const map = this.getKnownPlacesMap();
+    const out: Array<Place> = [];
+    for (const id of ids) {
+      const p = map.get(id);
+      if (p) {
+        out.push(p);
+      }
+    }
+    return out;
+  }
+
+  private getHiddenPlacesFromCache(): Array<Place> {
+    const session = this.getSession();
+    if (!session) {
+      return [];
+    }
+    const ids = this.placeService.getHiddenPlaceIds(session);
+    const map = this.getKnownPlacesMap();
+    const out: Array<Place> = [];
+    for (const id of ids) {
+      const p = map.get(id);
+      if (p) {
+        out.push(p);
+      }
+    }
+    return out;
   }
 
   private getHotTop(count: number): Array<Place> {
@@ -1759,17 +2248,13 @@ struct Index {
 
   private buildRouteMarkers(): Array<Marker> {
     const markers: Array<Marker> = [];
-    if (this.route) {
-      const startMarker: Marker = { lat: this.route.start.lat, lon: this.route.start.lon, label: '起点' };
-      const endMarker: Marker = { lat: this.route.end.lat, lon: this.route.end.lon, label: '终点' };
-      markers.push(startMarker);
-      markers.push(endMarker);
+    const startPoint = this.route ? this.route.start : this.routeStart;
+    const endPoint = this.route ? this.route.end : this.routeEnd;
+    if (startPoint) {
+      markers.push({ lat: startPoint.lat, lon: startPoint.lon, label: '起', kind: 'start' });
     }
-    if (this.routeStart) {
-      markers.push({ lat: this.routeStart.lat, lon: this.routeStart.lon, label: '起点' });
-    }
-    if (this.routeEnd) {
-      markers.push({ lat: this.routeEnd.lat, lon: this.routeEnd.lon, label: '终点' });
+    if (endPoint) {
+      markers.push({ lat: endPoint.lat, lon: endPoint.lon, label: '终', kind: 'end' });
     }
     if (this.focusPlace) {
       markers.push({ lat: this.focusPlace.lat, lon: this.focusPlace.lon, label: '查看位置', kind: 'focus' });
@@ -1779,12 +2264,15 @@ struct Index {
 
   @Builder
   private buildSearchBar(title: string, value: string, isStart: boolean): void {
-    Row() {
-      Text(title).fontSize(12).fontColor(this.nightMode ? '#c7d2e6' : '#7c8699');
+    Column({ space: 2 }) {
+      Text(title)
+        .fontSize(11)
+        .fontColor(this.nightMode ? '#c7d2e6' : '#7c8699');
       Text(value ? value : (isStart ? '请选择起点' : '请选择终点'))
-        .fontSize(15)
+        .fontSize(14)
         .fontColor(this.nightMode ? '#ffffff' : '#222f3d')
-        .margin({ left: 8 });
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis });
     }
     .padding(12)
     .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.85)' : 'rgba(255, 255, 255, 0.95)')
@@ -1816,7 +2304,13 @@ struct Index {
     .borderRadius(20)
     .shadow({ radius: 10, color: 'rgba(30, 60, 120, 0.2)', offsetX: 0, offsetY: 4 })
     .onClick(() => {
-      this.currentPage = this.getSession() ? PageView.Profile : PageView.Login;
+      const session = this.getSession();
+      this.currentPage = session ? PageView.Profile : PageView.Login;
+      if (session) {
+        void this.loadMessagesForSession(session);
+        void this.loadMyPlaces();
+        void this.refreshPlaces();
+      }
     });
   }
 
@@ -1832,26 +2326,19 @@ struct Index {
       }.margin({ bottom: 16 });
 
       Column({ space: 12 }) {
-        Stack() {
-          Text('校园地图')
-            .fontSize(16)
-            .fontColor('#ffffff')
-            .fontWeight(FontWeight.Bold);
-        }
-        .width(72)
-        .height(72)
-        .borderRadius(36)
-        .backgroundColor(this.colorPrimary)
-        .alignSelf(ItemAlign.Center)
-        .margin({ bottom: 6 })
-        .shadow({ radius: 12, color: 'rgba(108, 92, 231, 0.35)', offsetX: 0, offsetY: 6 });
+        Image($r('app.media.campus_banner'))
+          .width('100%')
+          .height(150)
+          .borderRadius(12)
+          .margin({ bottom: 16 })
+          .shadow({ radius: 14, color: 'rgba(0, 0, 0, 0.15)', offsetX: 0, offsetY: 8 });
 
         Text('登录后可保存自定义地点、参与投票与反馈')
           .fontSize(12)
           .fontColor('#7c8699')
           .textAlign(TextAlign.Center);
 
-        Text('注册需要邮箱验证码，登录仅需账号密码')
+        Text('注册仅需账号密码，邮箱可在个人中心绑定')
           .fontSize(11)
           .fontColor('#98a2b3')
           .textAlign(TextAlign.Center);
@@ -1951,27 +2438,6 @@ struct Index {
           .borderRadius(10)
           .padding({ left: 10, right: 10 })
           .onChange((value: string) => { this.password = value; });
-
-        TextInput({ text: this.registerEmail, placeholder: '邮箱（用于接收验证码）' })
-          .backgroundColor('#f5f6fa')
-          .borderRadius(10)
-          .padding({ left: 10, right: 10 })
-          .onChange((value: string) => { this.registerEmail = value; });
-
-        Row({ space: 8 }) {
-          TextInput({ text: this.registerCode, placeholder: '邮箱验证码' })
-            .backgroundColor('#f5f6fa')
-            .borderRadius(10)
-            .padding({ left: 10, right: 10 })
-            .layoutWeight(1)
-            .onChange((value: string) => { this.registerCode = value; });
-          Button('发送验证码')
-            .height(32)
-            .fontSize(12)
-            .backgroundColor(this.colorPrimary)
-            .fontColor('#ffffff')
-            .onClick(() => { this.sendRegisterCode(); });
-        }
 
         Button('注册')
           .backgroundColor(this.colorPrimary)
@@ -2138,6 +2604,17 @@ struct Index {
         Column() {
           if (this.showUi) {
             Column({ space: 10 }) {
+              if (this.hazardWarningVisible && this.hazardWarningText) {
+                Row() {
+                  Text('⚠ ' + this.hazardWarningText)
+                    .fontSize(12)
+                    .fontColor('#ffffff');
+                }
+                .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+                .backgroundColor('#ef4444')
+                .borderRadius(10)
+                .width('100%');
+              }
               Row() {
                 Column({ space: 6 }) {
                   this.buildSearchBar('起点', this.routeStartLabel, true);
@@ -2153,7 +2630,38 @@ struct Index {
                     .height(32)
                     .backgroundColor(this.colorPrimary)
                     .fontColor('#ffffff')
-                    .onClick(() => this.openHotPlaces());
+                    .onClick(() => { void this.openHotPlaces(); });
+                  Button('刷新')
+                    .fontSize(12)
+                    .width(64)
+                    .height(32)
+                    .backgroundColor(this.colorPrimaryLight)
+                    .fontColor(this.colorPrimary)
+                    .onClick(() => { void this.refreshPlaces(); });
+                  Button('定位')
+                    .fontSize(12)
+                    .width(64)
+                    .height(32)
+                    .backgroundColor(this.colorPrimary)
+                    .fontColor('#ffffff')
+                    .onClick(() => {
+                      if (this.myLocation) {
+                        const nextZoom = clampZoom(2.2);
+                        const offsets = this.computeCenterOffsets(this.myLocation.lat, this.myLocation.lon, nextZoom);
+                        this.zoom = nextZoom;
+                        this.offsetX = offsets.offsetX;
+                        this.offsetY = offsets.offsetY;
+                      }
+                    });
+                  if (this.dynamicNavActive) {
+                    Button('停止')
+                      .fontSize(12)
+                      .width(64)
+                      .height(32)
+                      .backgroundColor('#ffecec')
+                      .fontColor(this.colorDanger)
+                      .onClick(() => this.stopNavigation());
+                  }
                   Button(this.nightMode ? '日间' : '夜间')
                     .onClick(() => this.toggleNightMode())
                     .fontSize(12)
@@ -2181,6 +2689,58 @@ struct Index {
             .zIndex(3);
           }
 
+          // Focus view overlay: when user taps "查看位置" from lists/details
+          if (this.focusPlace) {
+            Row({ space: 10 }) {
+              Button('返回')
+                .height(34)
+                .fontSize(12)
+                .backgroundColor(this.colorPrimary)
+                .fontColor('#ffffff')
+                .onClick(() => this.exitFocusView());
+              Column() {
+                Text('查看位置')
+                  .fontSize(12)
+                  .fontColor(this.nightMode ? '#c7d2e6' : '#7c8699');
+                Text(this.focusPlace.name)
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.nightMode ? '#ffffff' : '#1d2a42');
+              }
+              .layoutWeight(1);
+            }
+            .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+            .backgroundColor(this.nightMode ? 'rgba(12, 20, 36, 0.72)' : 'rgba(255, 255, 255, 0.92)')
+            .borderRadius(12)
+            .width('100%')
+            .margin({ left: 12, right: 12, top: 10 })
+            .zIndex(4);
+
+            Column() {
+              Row({ space: 12 }) {
+                Button('导航前往')
+                  .layoutWeight(1)
+                  .height(40)
+                  .backgroundColor(this.colorPrimary)
+                  .fontColor('#ffffff')
+                  .onClick(() => this.navigateToFocusPlace());
+                Button('取消')
+                  .layoutWeight(1)
+                  .height(40)
+                  .backgroundColor(this.colorPrimaryLight)
+                  .fontColor(this.colorPrimary)
+                  .onClick(() => this.cancelFocusView());
+              }
+            }
+            .padding(14)
+            .width('94%')
+            .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.94)' : 'rgba(255, 255, 255, 0.98)')
+            .borderRadius(14)
+            .alignSelf(ItemAlign.Center)
+            .margin({ bottom: 96, top: 0 })
+            .zIndex(4);
+          }
+
           Column() {
               if (this.showUi && this.tapActionVisible) {
                 Column() {
@@ -2197,62 +2757,133 @@ struct Index {
                         .fontSize(11)
                         .fontColor(this.colorDanger);
                     }
-                    Row() {
-                      if (this.tapPlace.ownerId) {
-                        Button('👍')
-                          .backgroundColor(this.colorPrimary)
-                          .fontColor('#ffffff')
-                          .onClick(() => { this.handleVote(this.tapPlace!.id, 1); });
-                        Button('👎')
-                          .backgroundColor(this.colorPrimaryLight)
-                          .fontColor(this.colorPrimary)
-                          .onClick(() => { this.handleVote(this.tapPlace!.id, -1); });
-                      }
-                      if (this.isMinePlace(this.tapPlace)) {
-                        Button('编辑')
-                          .backgroundColor(this.colorPrimaryLight)
-                          .fontColor(this.colorPrimary)
-                          .onClick(() => { this.openEditPlace(this.tapPlace!, false); });
-                        if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
-                          Button(this.isAdmin() ? '确认修改并应用' : '提交审核')
+                    Column({ space: 8 }) {
+                      if (this.getSession()) {
+                        Row({ space: 8 }) {
+                          Button(this.voteButtonLabel(this.tapPlace!.id, 1))
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
                             .backgroundColor(this.colorPrimary)
                             .fontColor('#ffffff')
-                            .onClick(() => { this.handleApply(this.tapPlace!.id); });
+                            .onClick(() => { void this.handleVote(this.tapPlace!.id, 1); });
+                          Button(this.voteButtonLabel(this.tapPlace!.id, -1))
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor(this.colorPrimaryLight)
+                            .fontColor(this.colorPrimary)
+                            .onClick(() => { void this.handleVote(this.tapPlace!.id, -1); });
                         }
-                        Button('删除')
-                          .backgroundColor(this.colorPrimary)
-                          .fontColor('#ffffff')
-                          .onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                        .width('100%');
                       } else {
-                        Button('申请修改')
-                          .backgroundColor(this.colorPrimaryLight)
-                          .fontColor(this.colorPrimary)
-                          .onClick(() => { this.openEditPlace(this.tapPlace!, true); });
-                        Button('反馈')
-                          .backgroundColor(this.colorPrimaryLight)
-                          .fontColor(this.colorPrimary)
-                          .onClick(() => { this.handleFeedback(this.tapPlace!.id); });
+                        Text('登录后可点赞/收藏/隐藏')
+                          .fontSize(11)
+                          .fontColor('#7c8699');
                       }
-                      Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
-                        .backgroundColor(this.colorPrimaryLight)
-                        .fontColor(this.colorPrimary)
-                        .onClick(() => { this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
-                      if (this.isAdmin() && this.tapPlace.status === 'pending') {
-                        Button('通过')
-                          .backgroundColor(this.colorPrimary)
-                          .fontColor('#ffffff')
-                          .onClick(() => { this.handleApprove(this.tapPlace!.id); });
-                        Button('拒绝')
+
+                      Row({ space: 8 }) {
+                        Button(this.isPlaceFavorite(this.tapPlace.id) ? '取消收藏' : '收藏')
+                          .layoutWeight(1)
+                          .height(34)
+                          .fontSize(12)
                           .backgroundColor(this.colorPrimaryLight)
                           .fontColor(this.colorPrimary)
-                          .onClick(() => { this.handleReject(this.tapPlace!.id); });
+                          .onClick(() => { void this.handleToggleFavorite(this.tapPlace!.id, !this.isPlaceFavorite(this.tapPlace!.id)); });
+                        Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
+                          .layoutWeight(1)
+                          .height(34)
+                          .fontSize(12)
+                          .backgroundColor(this.colorPrimaryLight)
+                          .fontColor(this.colorPrimary)
+                          .onClick(() => { void this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
+                      }
+                      .width('100%');
+
+                      if (this.isMinePlace(this.tapPlace)) {
+                        Row({ space: 8 }) {
+                          Button('编辑')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#f0f2f7')
+                            .fontColor('#1d2a42')
+                            .onClick(() => { this.openEditPlace(this.tapPlace!, false); });
+                          if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
+                            Button(this.isAdmin() ? '确认修改并应用' : '提交审核')
+                              .layoutWeight(1)
+                              .height(34)
+                              .fontSize(12)
+                              .backgroundColor(this.colorPrimary)
+                              .fontColor('#ffffff')
+                              .onClick(() => { void this.handleApply(this.tapPlace!.id); });
+                          }
+                          Button('删除')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#ffecec')
+                            .fontColor(this.colorDanger)
+                            .onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                        }
+                        .width('100%');
+                      } else {
+                        Row({ space: 8 }) {
+                          Button(this.isAdmin() ? '修改' : '申请修改')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#f0f2f7')
+                            .fontColor('#1d2a42')
+                            .onClick(() => { this.openEditPlace(this.tapPlace!, true); });
+                          Button('反馈')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#f0f2f7')
+                            .fontColor('#1d2a42')
+                            .onClick(() => { void this.handleFeedback(this.tapPlace!.id); });
+                        }
+                        .width('100%');
+
+                        if (this.isAdmin()) {
+                          Row({ space: 8 }) {
+                            Button('删除')
+                              .layoutWeight(1)
+                              .height(34)
+                              .fontSize(12)
+                              .backgroundColor('#ffecec')
+                              .fontColor(this.colorDanger)
+                              .onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                          }
+                          .width('100%');
+                        }
+                      }
+
+                      if (this.isAdmin() && this.tapPlace.status === 'pending') {
+                        Row({ space: 8 }) {
+                          Button('通过')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#e8f7f1')
+                            .fontColor(this.colorAccent)
+                            .onClick(() => { void this.handleApprove(this.tapPlace!.id); });
+                          Button('拒绝')
+                            .layoutWeight(1)
+                            .height(34)
+                            .fontSize(12)
+                            .backgroundColor('#ffecec')
+                            .fontColor(this.colorDanger)
+                            .onClick(() => { void this.handleReject(this.tapPlace!.id); });
+                        }
+                        .width('100%');
                       }
                     }
-                    .justifyContent(FlexAlign.SpaceBetween)
                     .width('100%');
                   } else {
-                    Text('该位置暂无自定义地点').fontSize(12).fontColor('#7c8699');
-                    Button('添加自定义位置')
+                    Text('该位置暂无地点').fontSize(12).fontColor('#7c8699');
+                    Button('添加地点')
                       .backgroundColor(this.colorPrimary)
                       .fontColor('#ffffff')
                       .onClick(() => this.openAddPlaceFromTap());
@@ -2350,6 +2981,56 @@ struct Index {
           .height('100%')
           .align(Alignment.TopStart)
           .hitTestBehavior(HitTestMode.Transparent);
+
+          if (this.feedbackVisible) {
+            Stack() {
+              Column() {}
+                .width('100%')
+                .height('100%')
+                .backgroundColor('rgba(0,0,0,0.35)')
+                .onClick(() => { this.closeFeedbackDialog(); });
+
+              Column({ space: 10 }) {
+                Text('提交反馈')
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.nightMode ? '#ffffff' : '#1d2a42');
+                Text('请描述该地点的问题或建议')
+                  .fontSize(11)
+                  .fontColor(this.nightMode ? '#c7d2e6' : '#7c8699');
+                TextInput({ text: this.feedbackText, placeholder: '例如：位置偏移、名称错误、描述不准确…' })
+                  .onChange((v: string) => { this.feedbackText = v; })
+                  .backgroundColor(this.nightMode ? '#0f172a' : '#f5f6fa')
+                  .fontColor(this.nightMode ? '#ffffff' : '#1d2a42')
+                  .borderRadius(10)
+                  .padding({ left: 10, right: 10 })
+                  .height(44);
+                Row({ space: 10 }) {
+                  Button('取消')
+                    .layoutWeight(1)
+                    .height(36)
+                    .backgroundColor(this.colorPrimaryLight)
+                    .fontColor(this.colorPrimary)
+                    .onClick(() => { this.closeFeedbackDialog(); });
+                  Button('提交')
+                    .layoutWeight(1)
+                    .height(36)
+                    .backgroundColor(this.colorPrimary)
+                    .fontColor('#ffffff')
+                    .onClick(() => { void this.submitFeedback(); });
+                }
+                .width('100%');
+              }
+              .padding(14)
+              .width('92%')
+              .backgroundColor(this.nightMode ? 'rgba(20, 32, 54, 0.96)' : 'rgba(255, 255, 255, 0.98)')
+              .borderRadius(14)
+              .alignSelf(ItemAlign.Center);
+            }
+            .width('100%')
+            .height('100%')
+            .zIndex(10);
+          }
         }
         .width('100%')
         .height('100%');
@@ -2480,6 +3161,58 @@ struct Index {
       .shadow({ radius: 10, color: 'rgba(15, 25, 45, 0.06)', offsetX: 0, offsetY: 4 })
       .margin({ bottom: 12 });
 
+      if (this.getSession()) {
+        Column({ space: 10 }) {
+          Row() {
+            Text('邮箱绑定')
+              .fontSize(13)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1d2a42');
+            Blank().layoutWeight(1);
+            if (this.getSession()!.email) {
+              Text('已绑定: ' + this.getSession()!.email)
+                .fontSize(11)
+                .fontColor('#7c8699');
+            } else {
+              Text('未绑定')
+                .fontSize(11)
+                .fontColor('#ff4d4f');
+            }
+          }
+
+          TextInput({ text: this.bindEmail, placeholder: '请输入邮箱' })
+            .backgroundColor('#f5f6fa')
+            .borderRadius(10)
+            .padding({ left: 10, right: 10 })
+            .onChange((value: string) => { this.bindEmail = value; });
+
+          Row({ space: 8 }) {
+            TextInput({ text: this.bindCode, placeholder: '验证码' })
+              .backgroundColor('#f5f6fa')
+              .borderRadius(10)
+              .padding({ left: 10, right: 10 })
+              .layoutWeight(1)
+              .onChange((value: string) => { this.bindCode = value; });
+            Button('发送验证码')
+              .height(32)
+              .fontSize(12)
+              .backgroundColor(this.colorPrimary)
+              .fontColor('#ffffff')
+              .onClick(() => { void this.sendBindCode(); });
+          }
+
+          Button('确认绑定')
+            .backgroundColor(this.colorPrimary)
+            .fontColor('#ffffff')
+            .onClick(() => { void this.handleBindEmail(); });
+        }
+        .padding(14)
+        .backgroundColor(this.colorSurface)
+        .borderRadius(14)
+        .shadow({ radius: 10, color: 'rgba(15, 25, 45, 0.06)', offsetX: 0, offsetY: 4 })
+        .margin({ bottom: 12 });
+      }
+
       Column({ space: 8 }) {
         Text('我的数据')
           .fontSize(13)
@@ -2507,6 +3240,62 @@ struct Index {
               .fontColor(this.colorWarn);
             Text('待处理').fontSize(11).fontColor('#7c8699');
           }.layoutWeight(1);
+        }
+      }
+      .padding(14)
+      .backgroundColor(this.colorSurface)
+      .borderRadius(14)
+      .shadow({ radius: 10, color: 'rgba(15, 25, 45, 0.06)', offsetX: 0, offsetY: 4 })
+      .margin({ bottom: 12 });
+
+      // Location simulator controls (independent external program)
+      Column({ space: 10 }) {
+        Text('定位测试（模拟运动）')
+          .fontSize(13)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1d2a42');
+        Text('可配合电脑端 location-simulator 使用，返回 {lat, lon}。')
+          .fontSize(11)
+          .fontColor('#7c8699');
+        TextInput({ text: this.mockLocationServerUrl, placeholder: '模拟定位服务 URL，例如 http://电脑IP:9000/location' })
+          .backgroundColor('#f5f6fa')
+          .borderRadius(10)
+          .padding({ left: 10, right: 10 })
+          .onChange((value: string) => { this.mockLocationServerUrl = value; });
+        Row({ space: 8 }) {
+          Button(this.mockLocationEnabled ? '✓ 已启用模拟定位' : '启用模拟定位')
+            .fontSize(11)
+            .backgroundColor(this.mockLocationEnabled ? this.colorPrimary : this.colorPrimaryLight)
+            .fontColor(this.mockLocationEnabled ? '#ffffff' : this.colorPrimary)
+            .layoutWeight(1)
+            .onClick(() => {
+              this.mockLocationEnabled = !this.mockLocationEnabled;
+              this.stopLocationUpdates();
+              void this.initMyLocation();
+              this.startLocationUpdates(this.dynamicNavActive ? 1000 : this.locationUpdateIntervalMs);
+            });
+          Button('立即更新')
+            .fontSize(11)
+            .backgroundColor('#f0f2f7')
+            .fontColor('#1d2a42')
+            .onClick(() => { void this.initMyLocation(); });
+
+          Button('定位到我')
+            .fontSize(11)
+            .backgroundColor('#f0f2f7')
+            .fontColor('#1d2a42')
+            .enabled(this.myLocation !== null)
+            .onClick(() => { this.centerMapOnMyLocation(); });
+        }
+
+        Text(this.myLocationStatusText)
+          .fontSize(11)
+          .fontColor('#56657a');
+
+        if (this.myLocation) {
+          Text(`我的位置: ${this.myLocation.lat.toFixed(6)}, ${this.myLocation.lon.toFixed(6)}`)
+            .fontSize(11)
+            .fontColor('#1d2a42');
         }
       }
       .padding(14)
@@ -2598,10 +3387,10 @@ struct Index {
             .fontColor('#ffffff')
             .layoutWeight(1)
             .onClick(() => { this.currentPage = PageView.AdminPlaces; });
-          Button('我的审核')
+          Button('审核与反馈')
             .fontSize(12)
             .layoutWeight(1)
-              .onClick(() => { this.currentPage = PageView.AdminReview; });
+            .onClick(() => { this.currentPage = PageView.AdminReview; });
         }
         .margin({ bottom: 12 });
       }
@@ -2671,6 +3460,16 @@ struct Index {
           .backgroundColor(this.myPlacesTab === 'approved' ? this.colorPrimary : '#f0f2f7')
           .fontColor(this.myPlacesTab === 'approved' ? '#ffffff' : '#1d2a42')
           .onClick(() => { this.myPlacesTab = 'approved'; });
+        Button('收藏')
+          .fontSize(11)
+          .backgroundColor(this.myPlacesTab === 'favorite' ? this.colorPrimary : '#f0f2f7')
+          .fontColor(this.myPlacesTab === 'favorite' ? '#ffffff' : '#1d2a42')
+          .onClick(() => { this.myPlacesTab = 'favorite'; });
+        Button('隐藏')
+          .fontSize(11)
+          .backgroundColor(this.myPlacesTab === 'hidden' ? this.colorPrimary : '#f0f2f7')
+          .fontColor(this.myPlacesTab === 'hidden' ? '#ffffff' : '#1d2a42')
+          .onClick(() => { this.myPlacesTab = 'hidden'; });
       }
       .margin({ bottom: 12 });
 
@@ -2701,6 +3500,11 @@ struct Index {
                   .backgroundColor('#f1edff')
                   .fontColor(this.colorPrimary)
                   .onClick(() => { this.openPlaceOnMap(place, PageView.MyPlaces, 'my'); });
+                Button(this.isPlaceFavorite(place.id) ? '取消收藏' : '收藏')
+                  .fontSize(11)
+                  .backgroundColor('#f0f2f7')
+                  .fontColor('#1d2a42')
+                  .onClick(() => { void this.handleToggleFavorite(place.id, !this.isPlaceFavorite(place.id)); });
                 if (place.status === 'private' || place.status === 'draft') {
                   Button('提交审核')
                     .fontSize(11)
@@ -2708,13 +3512,11 @@ struct Index {
                     .fontColor(this.colorAccent)
                     .onClick(() => { void this.handleSubmitReview(place); });
                 }
-                if (place.status === 'approved' || place.status === 'published') {
-                  Button(this.isPlaceHidden(place.id) ? '显示' : '隐藏')
-                    .fontSize(11)
-                    .backgroundColor('#f0f2f7')
-                    .fontColor('#1d2a42')
-                    .onClick(() => { void this.handleToggleHiddenFromMyPlaces(place); });
-                }
+                Button(this.isPlaceHidden(place.id) ? '显示' : '隐藏')
+                  .fontSize(11)
+                  .backgroundColor('#f0f2f7')
+                  .fontColor('#1d2a42')
+                  .onClick(() => { void this.handleToggleHiddenFromMyPlaces(place); });
                 Button('删除')
                   .fontSize(11)
                   .backgroundColor('#ffecec')
@@ -2727,6 +3529,9 @@ struct Index {
             .borderRadius(12);
           }, (place: Place) => `my-${place.id}`);
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start);
       }
       .height('100%');
     }
@@ -2751,7 +3556,7 @@ struct Index {
           .height(28)
           .backgroundColor('#f0f2f7')
           .fontColor('#1d2a42')
-          .onClick(() => { this.refreshPlaces(); });
+          .onClick(() => { void this.refreshPlaces(); });
       }.margin({ bottom: 12 });
 
       Text('人气 Top 5')
@@ -2794,6 +3599,9 @@ struct Index {
             .onClick(() => { this.openPlaceDetail(place); });
           }, (place: Place) => `hot5-${place.id}`);
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start);
       }
       .height(260)
       .margin({ bottom: 12 });
@@ -2818,16 +3626,16 @@ struct Index {
                   .fontColor('#7c8699');
               }
               Row({ space: 8 }) {
-                Button('👍')
+                Button(this.voteButtonLabel(place.id, 1))
                   .fontSize(11)
                   .backgroundColor('#ffffff')
                   .fontColor('#1aa168')
-                  .onClick(() => { this.handleVote(place.id, 1); });
-                Button('👎')
+                  .onClick(() => { void this.handleVote(place.id, 1); });
+                Button(this.voteButtonLabel(place.id, -1))
                   .fontSize(11)
                   .backgroundColor('#ffffff')
                   .fontColor('#d23f3f')
-                  .onClick(() => { this.handleVote(place.id, -1); });
+                  .onClick(() => { void this.handleVote(place.id, -1); });
                 Button('查看位置')
                   .fontSize(11)
                   .backgroundColor('#f1edff')
@@ -2840,6 +3648,9 @@ struct Index {
             .borderRadius(12);
           }, (place: Place) => `hot10-${place.id}`);
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start);
       }
       .height('100%');
     }
@@ -2877,16 +3688,26 @@ struct Index {
           .fontColor('#7c8699')
           .margin({ bottom: 10 });
         Row({ space: 10 }) {
-          Button('👍')
+          Button(this.voteButtonLabel(this.detailPlace!.id, 1))
             .fontSize(12)
             .backgroundColor('#ffffff')
             .fontColor('#1aa168')
-            .onClick(() => { this.handleVote(this.detailPlace!.id, 1); });
-          Button('👎')
+            .onClick(() => { void this.handleVote(this.detailPlace!.id, 1); });
+          Button(this.voteButtonLabel(this.detailPlace!.id, -1))
             .fontSize(12)
             .backgroundColor('#ffffff')
             .fontColor('#d23f3f')
-            .onClick(() => { this.handleVote(this.detailPlace!.id, -1); });
+            .onClick(() => { void this.handleVote(this.detailPlace!.id, -1); });
+          Button(this.isPlaceFavorite(this.detailPlace!.id) ? '取消收藏' : '收藏')
+            .fontSize(12)
+            .backgroundColor('#f0f2f7')
+            .fontColor('#1d2a42')
+            .onClick(() => { void this.handleToggleFavorite(this.detailPlace!.id, !this.isPlaceFavorite(this.detailPlace!.id)); });
+          Button(this.isPlaceHidden(this.detailPlace!.id) ? '显示' : '隐藏')
+            .fontSize(12)
+            .backgroundColor('#f0f2f7')
+            .fontColor('#1d2a42')
+            .onClick(() => { void this.handleToggleHidden(this.detailPlace!.id, !this.isPlaceHidden(this.detailPlace!.id)); });
           Button('查看位置')
             .fontSize(12)
             .backgroundColor('#f1edff')
@@ -2943,6 +3764,18 @@ struct Index {
                 .fontSize(13)
                 .fontWeight(FontWeight.Bold)
                 .fontColor('#1d2a42');
+              Row({ space: 8 }) {
+                Button('上传全部地图节点')
+                  .fontSize(11)
+                  .backgroundColor(this.colorPrimary)
+                  .fontColor('#ffffff')
+                  .onClick(() => { void this.handleUploadAllSystemLabels(); });
+                Button('刷新')
+                  .fontSize(11)
+                  .backgroundColor('#f1edff')
+                  .fontColor(this.colorPrimary)
+                  .onClick(() => { void this.refreshPlaces(); });
+              }
               ForEach(this.getAdminSystemPlaces(), (place: Place) => {
                 Column({ space: 6 }) {
                   Text(place.name).fontSize(12).fontWeight(FontWeight.Bold);
@@ -3052,6 +3885,9 @@ struct Index {
             .shadow({ radius: 10, color: 'rgba(15, 25, 45, 0.06)', offsetX: 0, offsetY: 4 });
           }
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start);
       }
       .height('100%');
     }
@@ -3066,50 +3902,148 @@ struct Index {
     Column() {
       Row() {
         Button('返回').onClick(() => { this.currentPage = PageView.Profile; });
-        Text('我的审核')
+        Text('审核与反馈')
           .fontSize(16)
           .fontWeight(FontWeight.Bold)
           .margin({ left: 12 });
       }.margin({ bottom: 12 });
 
+      Row({ space: 8 }) {
+        Button('待审核')
+          .fontSize(11)
+          .backgroundColor(this.adminReviewTab === 'review' ? this.colorPrimary : '#f0f2f7')
+          .fontColor(this.adminReviewTab === 'review' ? '#ffffff' : '#1d2a42')
+          .onClick(() => { this.adminReviewTab = 'review'; });
+        Button('反馈')
+          .fontSize(11)
+          .backgroundColor(this.adminReviewTab === 'feedback' ? this.colorPrimary : '#f0f2f7')
+          .fontColor(this.adminReviewTab === 'feedback' ? '#ffffff' : '#1d2a42')
+          .onClick(() => {
+            this.adminReviewTab = 'feedback';
+            const session = this.getSession();
+            if (session) {
+              void this.loadMessagesForSession(session);
+            }
+          });
+        Blank().layoutWeight(1);
+        Button('刷新')
+          .fontSize(11)
+          .height(28)
+          .backgroundColor('#f0f2f7')
+          .fontColor('#1d2a42')
+          .onClick(() => {
+            const session = this.getSession();
+            if (session) {
+              void this.loadMessagesForSession(session);
+            }
+          });
+      }
+      .margin({ bottom: 12 });
+
       Scroll() {
         Column({ space: 10 }) {
-          if (this.pendingPlaces.length === 0) {
-            Text('暂无待审核地点')
-              .fontSize(12)
-              .fontColor('#7c8699');
-          }
-          ForEach(this.pendingPlaces, (place: Place) => {
-            Column({ space: 6 }) {
-              Text(place.name)
+          if (this.adminReviewTab === 'review') {
+            if (this.pendingPlaces.length === 0) {
+              Text('暂无待审核地点')
                 .fontSize(12)
-                .fontWeight(FontWeight.Bold);
-              Text((place.ownerName || place.ownerId || '用户') + ' · ' + this.renderPlaceStatus(place.status))
-                .fontSize(11)
                 .fontColor('#7c8699');
-              Row({ space: 8 }) {
-                Button('查看位置')
-                  .fontSize(11)
-                  .backgroundColor('#f1edff')
-                  .fontColor(this.colorPrimary)
-                  .onClick(() => { this.openPlaceOnMap(place, PageView.AdminReview, 'review'); });
-                Button('通过')
-                  .fontSize(11)
-                  .backgroundColor('#e8f7f1')
-                  .fontColor(this.colorAccent)
-                  .onClick(() => { this.handleApprove(place.id); });
-                Button('拒绝')
-                  .fontSize(11)
-                  .backgroundColor('#ffecec')
-                  .fontColor(this.colorDanger)
-                  .onClick(() => { this.handleReject(place.id); });
-              }
             }
-            .padding(10)
-            .backgroundColor(this.colorSurface)
-            .borderRadius(12);
-          }, (place: Place) => `review-${place.id}`);
+            ForEach(this.pendingPlaces, (place: Place) => {
+              Column({ space: 6 }) {
+                Text(place.name)
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Bold);
+                Text((place.ownerName || place.ownerId || '用户') + ' · ' + this.renderPlaceStatus(place.status))
+                  .fontSize(11)
+                  .fontColor('#7c8699');
+                Row({ space: 8 }) {
+                  Button('查看位置')
+                    .fontSize(11)
+                    .backgroundColor('#f1edff')
+                    .fontColor(this.colorPrimary)
+                    .onClick(() => { this.openPlaceOnMap(place, PageView.AdminReview, 'review'); });
+                  Button('通过')
+                    .fontSize(11)
+                    .backgroundColor('#e8f7f1')
+                    .fontColor(this.colorAccent)
+                    .onClick(() => { this.handleApprove(place.id); });
+                  Button('拒绝')
+                    .fontSize(11)
+                    .backgroundColor('#ffecec')
+                    .fontColor(this.colorDanger)
+                    .onClick(() => { this.handleReject(place.id); });
+                }
+              }
+              .padding(10)
+              .backgroundColor(this.colorSurface)
+              .borderRadius(12)
+              .width('100%');
+            }, (place: Place) => `review-${place.id}`);
+          }
+
+          if (this.adminReviewTab === 'feedback') {
+            if (this.messages.length === 0) {
+              Text('暂无反馈')
+                .fontSize(12)
+                .fontColor('#7c8699');
+            }
+            ForEach(this.messages, (msg: UserMessage) => {
+              Column({ space: 6 }) {
+                Row() {
+                  Text(msg.title || '反馈')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Bold);
+                  Blank().layoutWeight(1);
+                  Text(this.formatMessageTime(msg.createdAt))
+                    .fontSize(10)
+                    .fontColor('#9aa4b2');
+                }
+                Text(msg.content)
+                  .fontSize(11)
+                  .fontColor('#51607a');
+                if (msg.place) {
+                  Button('查看位置')
+                    .fontSize(11)
+                    .backgroundColor('#f1edff')
+                    .fontColor(this.colorPrimary)
+                    .onClick(() => {
+                      const snap = msg.place;
+                      if (!snap) {
+                        return;
+                      }
+                      const snapSourceType: '' | 'system' = snap.sourceType === 'system' ? 'system' : '';
+                      const p: Place = {
+                        id: snap.sourcePlaceId ? snap.sourcePlaceId : `fb-${msg.id}`,
+                        name: snap.name,
+                        description: snap.description || '',
+                        lat: snap.lat,
+                        lon: snap.lon,
+                        type: snap.type,
+                        ownerId: '',
+                        ownerName: '',
+                        status: 'approved',
+                        createdAt: msg.createdAt,
+                        updatedAt: msg.createdAt,
+                        likes: 0,
+                        dislikes: 0,
+                        imageUrl: snap.imageUrl || '',
+                        sourceKey: snap.sourceKey || '',
+                        sourceType: snapSourceType
+                      };
+                      this.openPlaceOnMap(p, PageView.AdminReview, 'feedback');
+                    });
+                }
+              }
+              .padding(10)
+              .backgroundColor(this.colorSurface)
+              .borderRadius(12)
+              .width('100%');
+            }, (msg: UserMessage) => `fb-${msg.id}`);
+          }
         }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+        .justifyContent(FlexAlign.Start);
       }
       .height('100%');
     }
@@ -3127,9 +4061,55 @@ struct Index {
     this.placeDesc = '';
     this.placeImage = '';
     this.clearEditingState();
+    const session = this.getSession();
+    if (session && session.isAdmin) {
+      this.editingSourceType = 'system';
+    }
     this.pickMode = MapPickMode.None;
     this.tapActionVisible = false;
     this.currentPage = PageView.AddPlace;
+  }
+
+  private async handleUploadAllSystemLabels(): Promise<void> {
+    const session = this.getSession();
+    if (!session || !session.isAdmin) {
+      promptAction.showToast({ message: '仅管理员可上传系统地点', duration: 1500 });
+      return;
+    }
+    if (!this.labels || this.labels.length === 0) {
+      promptAction.showToast({ message: '未加载地图节点', duration: 1500 });
+      return;
+    }
+    promptAction.showToast({ message: `开始上传：共 ${this.labels.length} 个节点`, duration: 1500 });
+    let okCount = 0;
+    let failCount = 0;
+    for (let i = 0; i < this.labels.length; i += 1) {
+      const label = this.labels[i];
+      if (!label || !label.name) {
+        continue;
+      }
+      const sourceKey = this.placeService.makeSystemSourceKey(label.name, label.lat, label.lon);
+      const input: SaveDraftInput = {
+        name: label.name,
+        description: '系统地点',
+        type: 'normal',
+        point: { lat: label.lat, lon: label.lon },
+        status: 'approved',
+        sourceType: 'system',
+        sourceKey
+      };
+      const saved = await this.placeService.saveDraft(input, session);
+      if (saved) {
+        okCount += 1;
+      } else {
+        failCount += 1;
+      }
+      if ((i + 1) % 50 === 0) {
+        promptAction.showToast({ message: `上传进度：${i + 1}/${this.labels.length}（成功 ${okCount}）`, duration: 1200 });
+      }
+    }
+    await this.refreshPlaces();
+    promptAction.showToast({ message: `上传完成：成功 ${okCount}，失败 ${failCount}`, duration: 2000 });
   }
 
   private async handleMarkWaterMine(): Promise<void> {
@@ -3158,7 +4138,8 @@ struct Index {
     await this.refreshPlaces();
   }
 
-  private openHotPlaces(): void {
+  private async openHotPlaces(): Promise<void> {
+    await this.refreshPlaces();
     this.updateHotPlaces();
     this.currentPage = PageView.HotPlaces;
   }
@@ -3207,7 +4188,10 @@ struct Index {
       return;
     }
     const hidden = this.isPlaceHidden(place.id);
-    await this.placeService.toggleHidden(place.id, !hidden, session);
+    const ok = await this.placeService.toggleHidden(place.id, !hidden, session);
+    if (!ok) {
+      promptAction.showToast({ message: '操作失败，请检查网络或登录状态', duration: 1500 });
+    }
     await this.refreshPlaces();
   }
 
@@ -3217,7 +4201,7 @@ struct Index {
     Column() {
       Row() {
         Button('返回').onClick(() => { this.currentPage = PageView.Map; });
-        Text(this.editingPlaceId ? '编辑地点' : (this.editingSourceKey ? '提交修改' : '添加自定义位置'))
+        Text(this.editingPlaceId ? '编辑地点' : (this.editingSourceKey ? '提交修改' : '添加地点'))
           .fontSize(16)
           .fontWeight(FontWeight.Bold)
           .margin({ left: 12 });

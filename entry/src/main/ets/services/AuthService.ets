@@ -23,6 +23,7 @@ interface AuthResponse {
 
 interface ErrorResponse {
   error?: string;
+  message?: string;
 }
 
 class AuthRequest extends HttpRequestBody {
@@ -41,37 +42,41 @@ class AuthRequest extends HttpRequestBody {
 }
 
 class EmailRequest extends HttpRequestBody {
-  account: string;
+  username: string;
   email: string;
+  purpose: 'bind' | 'reset';
 
-  constructor(account: string, email: string) {
+  constructor(username: string, email: string, purpose: 'bind' | 'reset') {
     super();
-    this.account = account;
+    this.username = username;
     this.email = email;
+    this.purpose = purpose;
   }
 }
 
-class VerifyCodeRequest extends HttpRequestBody {
-  account: string;
+class BindEmailRequest extends HttpRequestBody {
+  username: string;
+  email: string;
   code: string;
 
-  constructor(account: string, code: string) {
+  constructor(username: string, email: string, code: string) {
     super();
-    this.account = account;
+    this.username = username;
+    this.email = email;
     this.code = code;
   }
 }
 
 class ResetPasswordRequest extends HttpRequestBody {
-  account: string;
+  username: string;
   code: string;
-  password: string;
+  newPassword: string;
 
-  constructor(account: string, code: string, password: string) {
+  constructor(username: string, code: string, newPassword: string) {
     super();
-    this.account = account;
+    this.username = username;
     this.code = code;
-    this.password = password;
+    this.newPassword = newPassword;
   }
 }
 
@@ -112,7 +117,7 @@ export class AuthService {
       try {
         const payload: AuthRequest = new AuthRequest(trimmed, password, email);
         const resp: HttpResponse = await this.client.requestWithStatus(http.RequestMethod.POST, '/api/register', payload);
-        if (resp.status === 401) {
+        if (resp.status === 401 || resp.status === 400) {
           this.lastError = this.extractErrorMessage(resp.body) || '用户名或密码错误';
           return null;
         }
@@ -152,7 +157,7 @@ export class AuthService {
       try {
         const payload: AuthRequest = new AuthRequest(trimmed, password, undefined);
         const resp: HttpResponse = await this.client.requestWithStatus(http.RequestMethod.POST, '/api/login', payload);
-        if (resp.status === 401) {
+        if (resp.status === 401 || resp.status === 400) {
           this.lastError = this.extractErrorMessage(resp.body) || '用户名或密码错误';
           return null;
         }
@@ -210,7 +215,7 @@ export class AuthService {
     }
   }
 
-  async sendEmailCode(account: string, email: string): Promise<boolean> {
+  async sendEmailCode(account: string, email: string, purpose: 'bind' | 'reset'): Promise<boolean> {
     const trimmed = account.trim();
     const target = email.trim();
     this.lastError = '';
@@ -220,10 +225,10 @@ export class AuthService {
     }
     if (this.useRemote && this.client) {
       try {
-        const payload: EmailRequest = new EmailRequest(trimmed, target);
+        const payload: EmailRequest = new EmailRequest(trimmed, target, purpose);
         const resp = this.emailClient
-          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/admin/send-mail', payload)
-          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/admin/send-mail', payload);
+          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/email/send', payload)
+          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/email/send', payload);
         if (resp.status >= 200 && resp.status < 300) {
           return true;
         }
@@ -240,25 +245,26 @@ export class AuthService {
     return false;
   }
 
-  async verifyEmailCode(account: string, code: string): Promise<boolean> {
+  async bindEmail(account: string, email: string, code: string): Promise<boolean> {
     const trimmed = account.trim();
+    const target = email.trim();
     const trimmedCode = code.trim();
     this.lastError = '';
-    if (!trimmed || !trimmedCode) {
-      this.lastError = '账号或验证码不能为空';
+    if (!trimmed || !target || !trimmedCode) {
+      this.lastError = '账号、邮箱或验证码不能为空';
       return false;
     }
     if (this.useRemote && this.client) {
       try {
-        const payload: VerifyCodeRequest = new VerifyCodeRequest(trimmed, trimmedCode);
+        const payload: BindEmailRequest = new BindEmailRequest(trimmed, target, trimmedCode);
         const resp = this.emailClient
-          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/admin/verify-code', payload)
-          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/admin/verify-code', payload);
+          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/email/bind', payload)
+          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/email/bind', payload);
         if (resp.status >= 200 && resp.status < 300) {
           return true;
         }
         const parsed = this.extractErrorMessage(resp.body);
-        this.lastError = parsed || (typeof resp.body === 'string' && resp.body.length > 0 ? String(resp.body) : `验证失败，状态码${resp.status}`);
+        this.lastError = parsed || (typeof resp.body === 'string' && resp.body.length > 0 ? String(resp.body) : `绑定失败，状态码${resp.status}`);
         return false;
       } catch (e) {
         this.lastError = `网络错误：${String(e)}`;
@@ -282,8 +288,8 @@ export class AuthService {
       try {
         const payload: ResetPasswordRequest = new ResetPasswordRequest(trimmed, trimmedCode, nextPassword);
         const resp = this.emailClient
-          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/admin/reset-password', payload)
-          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/admin/reset-password', payload);
+          ? await this.emailClient.requestWithStatus(http.RequestMethod.POST, '/api/password/reset', payload)
+          : await this.client.requestWithStatus(http.RequestMethod.POST, '/api/password/reset', payload);
         if (resp.status >= 200 && resp.status < 300) {
           return true;
         }
@@ -312,11 +318,33 @@ export class AuthService {
   }
 
   private extractErrorMessage(text: string): string {
+    const normalize = (msg: string): string => {
+      const trimmed = msg.trim();
+      const lower = trimmed.toLowerCase();
+      if (!trimmed) {
+        return '';
+      }
+      if (lower.includes('invalid credentials')) {
+        return '用户名或密码错误';
+      }
+      if (lower.includes('user exists')) {
+        return '用户已存在';
+      }
+      if (lower.includes('name required')) {
+        return '请填写必填信息';
+      }
+      return trimmed;
+    };
+
     try {
       const raw: ErrorResponse = JSON.parse(text) as ErrorResponse;
       const errMsg: string | undefined = raw ? raw.error : undefined;
+      const message: string | undefined = raw ? raw.message : undefined;
       if (typeof errMsg === 'string' && errMsg.length > 0) {
-        return errMsg;
+        return normalize(errMsg);
+      }
+      if (typeof message === 'string' && message.length > 0) {
+        return normalize(message);
       }
     } catch {
       // ignore parse error

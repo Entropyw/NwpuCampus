@@ -164,7 +164,7 @@ export struct MapCanvas {
     const height = this.canvasSize.height;
     const zoom = clampZoom(this.zoom);
     const point = project(lat, lon, bounds, width, height, zoom, this.offsetX, this.offsetY);
-    const size = this.scaleMarker(9);
+    const size = this.scaleMarker(6);
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(point.x, point.y, size, 0, Math.PI * 2);
@@ -196,7 +196,7 @@ export struct MapCanvas {
     ctx.fill();
     if (label) {
       ctx.fillStyle = this.nightMode ? '#e7edf7' : '#1d2a42';
-      ctx.font = `${this.scaleFont(14)}px sans-serif`;
+      ctx.font = `${this.scaleFont(12)}px sans-serif`;
       ctx.fillText(label, point.x + size + 2, point.y - size * 0.6);
     }
   }
@@ -205,6 +205,10 @@ export struct MapCanvas {
     for (const marker of this.markers) {
       if (marker.kind === 'focus') {
         this.drawFocusMarker(ctx, bounds, marker.lat, marker.lon, marker.label || '');
+      } else if (marker.kind === 'start') {
+        this.drawMarker(ctx, bounds, marker.lat, marker.lon, '#0fbc7a', marker.label || '起');
+      } else if (marker.kind === 'end') {
+        this.drawMarker(ctx, bounds, marker.lat, marker.lon, '#ff4d4f', marker.label || '终');
       } else {
         this.drawMarker(ctx, bounds, marker.lat, marker.lon, '#4f79ff', marker.label || '');
       }
@@ -215,7 +219,31 @@ export struct MapCanvas {
     if (!this.myLocation) {
       return;
     }
-    this.drawMarker(ctx, bounds, this.myLocation.lat, this.myLocation.lon, '#0fbc7a', '我');
+    // Distinct symbol for "my location": outer ring + inner dot.
+    const width = this.canvasSize.width;
+    const height = this.canvasSize.height;
+    const zoom = clampZoom(this.zoom);
+    const point = project(this.myLocation.lat, this.myLocation.lon, bounds, width, height, zoom, this.offsetX, this.offsetY);
+    const rOuter = this.scaleMarker(8);
+    const rInner = this.scaleMarker(3.2);
+    ctx.save();
+    ctx.lineWidth = this.scaleStroke(2.6);
+    ctx.strokeStyle = '#2563eb';
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, rOuter, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#2563eb';
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, rInner, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = this.nightMode ? '#e7edf7' : '#1d2a42';
+    ctx.font = `${this.scaleFont(14)}px sans-serif`;
+    ctx.fillText('我', point.x + rOuter + 3, point.y - rOuter * 0.3);
+    ctx.restore();
   }
 
   private drawMarker(ctx: CanvasRenderingContext2D, bounds: Bounds, lat: number, lon: number, color: string, label: string): void {
