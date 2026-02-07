@@ -1,10 +1,9 @@
 import common from '@ohos.app.ability.common';
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import geoLocationManager from '@ohos.geoLocationManager';
+import preferences from '@ohos.data.preferences';
 import promptAction from '@ohos.promptAction';
-import netHttp from '@ohos.net.http';
 import vibrator from '@ohos.vibrator';
-import textToSpeech from '@ohos.textToSpeech';
 import { MapCanvas } from '../components/MapCanvas';
 import { LongPressHandler, MapEventBus, SizeHandler, TapHandler, TransformHandler } from '../services/MapEventBus';
 import { AuthService } from '../services/AuthService';
@@ -13,23 +12,10 @@ import { OsmParser } from '../services/OsmParser';
 import { PlaceService, SaveDraftInput } from '../services/PlaceService';
 import { RoutePlanner } from '../services/RoutePlanner';
 import { clampZoom } from '../services/MapMath';
-import { LatLon, MapLabel, Marker, Place, PlaceFilter, PlaceType, PlaceTypeFlags, RenderData, RouteState, UserSession } from '../model/MapTypes';
+import { Bounds, LatLon, MapLabel, MapWay, Marker, Place, PlaceFilter, PlaceType, PlaceTypeFlags, RenderData, RouteState, UserSession } from '../model/MapTypes';
 
 interface PermissionRequestResult {
   authResults?: Array<number>;
-}
-
-interface AtManagerLike {
-  requestPermissionsFromUser(ctx: common.UIAbilityContext, permissions: Array<string>): Promise<PermissionRequestResult | null>;
-  checkAccessToken?: (tokenId: number, permissionName: string) => number;
-}
-
-interface ApplicationInfoLike {
-  accessTokenId?: number;
-}
-
-interface UIAbilityContextLike {
-  applicationInfo?: ApplicationInfoLike;
 }
 
 // Types for photo access helper (named interfaces to satisfy arkts linter)
@@ -74,6 +60,8 @@ interface RawMessageFields {
   date?: number;
   placeId?: string;
   type?: string;
+  read?: boolean;
+  readAt?: number | null;
 }
 
 // ArkTS linter forbids intersection types. Use interface inheritance instead
@@ -121,9 +109,7 @@ class IndexTransformHandler extends TransformHandler {
   }
 
   onTransform(zoom: number, offsetX: number, offsetY: number): void {
-    this.host.zoom = zoom;
-    this.host.offsetX = offsetX;
-    this.host.offsetY = offsetY;
+    this.host.handleExternalTransform(zoom, offsetX, offsetY);
   }
 }
 
@@ -182,6 +168,7 @@ struct Index {
   @State myLocation: LatLon | null = null;
   @State myLocationStatusText: string = '定位未初始化';
   @State myLocationUpdatedAt: number = 0;
+  @State isOffCampus: boolean = false;
   @State zoom: number = 1;
   @State offsetX: number = 0;
   @State offsetY: number = 0;
@@ -199,8 +186,6 @@ struct Index {
   @State tapLocation: LatLon | null = null;
   @State profileNickname: string = '';
   @State profileAvatarUrl: string = '';
-  @State profileOldPassword: string = '';
-  @State profileNewPassword: string = '';
   @State authStatus: string = '未登录';
   @State authError: string = '';
   @State username: string = '';
@@ -255,8 +240,7 @@ struct Index {
   @State hazardWarningVisible: boolean = false;
   @State hazardWarningText: string = '';
 
-  @State mockLocationEnabled: boolean = false;
-  @State mockLocationServerUrl: string = '';
+  private hazardWarningToken: number = 0;
 
   private refreshInFlight: boolean = false;
 
@@ -270,40 +254,27 @@ struct Index {
   private labels: Array<MapLabel> = [];
   private startIndex: number = 0;
   private endIndex: number = 1;
-  private useMockLocation: boolean = false;
   private locationUpdateIntervalId: number | null = null;
   private locationUpdateIntervalMs: number = 2000;
   private activeLocationUpdateIntervalMs: number = 0;
 
   private locationPermissionRequested: boolean = false;
+  private locationPermissionGranted: boolean = false;
 
-  private mockSimStartAt: number = Date.now();
-  private mockSimCenter: LatLon | null = null;
-  private mockSimRadiusM: number = 120;
-  private mockSimSpeedMps: number = 1.4;
+  private hasCenteredOnMyLocation: boolean = false;
+  private lastProgramCenterAt: number = 0;
+  private lastUserTransformAt: number = 0;
 
   private navRecalcAt: number = 0;
   private navRecalcLoc: LatLon | null = null;
 
-  private ttsEngine: TtsEngine | null = null;
-interface VibratorModule {
-  vibrate?: (duration: number) => void;
-}
-
-interface TtsEngine {
-  speakText?: (text: string) => void;
-  stop?: () => void;
-}
-
-interface TtsModule {
-  createTextToSpeechEngine?: () => TtsEngine;
-}
-
+  private offCampusToastAt: number = 0;
 
   private poiFallback: Array<MapLabel> = this.buildFallbackLabels();
   private savedFilter: PlaceFilter | null = null;
   private lastLocation: LatLon | null = null;
   private lastHazardAlertAt: number = 0;
+  private lastWaterMineDangerAt: number = 0;
   private messagePageSize: number = 20;
 
   private colorPrimary: string = '#7B7CF6';
@@ -323,15 +294,17 @@ interface TtsModule {
   private mapCanvasWidth: number = 0;
   private mapCanvasHeight: number = 0;
 
-    aboutToAppear(): void {
-      // business API follows the documented base
-      this.apiBase = 'http://121.36.80.168:8080';
+  aboutToAppear(): void {
+    // business API follows the documented base
+    this.apiBase = 'http://121.36.80.168:8080';
     this.placeService.enableRemote(this.apiBase);
     this.authService.enableRemote(this.apiBase);
     this.messageService.enableRemote(this.apiBase);
-      this.authService.enableEmailRemote(this.apiBase);
+    this.authService.enableEmailRemote(this.apiBase);
     this.loadMap();
     this.locationPermissionRequested = false;
+    this.locationPermissionGranted = false;
+    this.hasCenteredOnMyLocation = false;
     void this.initMyLocation();
     this.startLocationUpdates();
     // register map event handlers
@@ -370,15 +343,15 @@ interface TtsModule {
   }
 
   private createEmptyRenderData(): RenderData {
-    return {
-      bounds: { minLat: 34.029, maxLat: 34.034, minLon: 108.758, maxLon: 108.766 },
-      roads: [],
-      buildings: [],
-      waters: [],
-      areas: [],
-      pitches: [],
-      labels: []
-    };
+    const bounds: Bounds = { minLat: 34.029, maxLat: 34.034, minLon: 108.758, maxLon: 108.766 };
+    const roads: Array<MapWay> = [];
+    const buildings: Array<MapWay> = [];
+    const waters: Array<MapWay> = [];
+    const areas: Array<MapWay> = [];
+    const pitches: Array<MapWay> = [];
+    const labels: Array<MapLabel> = [];
+    const data: RenderData = { bounds, roads, buildings, waters, areas, pitches, labels };
+    return data;
   }
 
   private async loadMap(): Promise<void> {
@@ -399,14 +372,8 @@ interface TtsModule {
       }
       const parsed = this.osmParser.parse(osmText);
       this.renderData = parsed;
-      this.labels = parsed.labels.length ? parsed.labels : this.poiFallback;
-      if (!this.routeStartLabel && this.labels.length > 0) {
-        this.routeStartLabel = this.labels[0].name;
-      }
-      if (!this.routeEndLabel && this.labels.length > 1) {
-        this.routeEndLabel = this.labels[1].name;
-      }
-      this.placeService.seedSystemPlaces(this.labels);
+      // Keep labels only as map metadata. Do NOT seed/display OSM-derived “system places”.
+      this.labels = parsed.labels.length ? parsed.labels : [];
       this.refreshPlaces();
     } catch (error) {
       console.error(`OSM 读取失败: ${String(error)}`);
@@ -446,6 +413,10 @@ interface TtsModule {
   private cycleStart(): void {
     this.routeStart = null;
     const combined = this.getPoiCandidates();
+    if (combined.length === 0) {
+      promptAction.showToast({ message: '暂无可选地点，请使用“地图点选”选择起点', duration: 1500 });
+      return;
+    }
     this.startIndex = (this.startIndex + 1) % combined.length;
     if (this.startIndex === this.endIndex) {
       this.endIndex = (this.endIndex + 1) % combined.length;
@@ -460,6 +431,10 @@ interface TtsModule {
   private cycleEnd(): void {
     this.routeEnd = null;
     const combined = this.getPoiCandidates();
+    if (combined.length === 0) {
+      promptAction.showToast({ message: '暂无可选地点，请使用“地图点选”选择终点', duration: 1500 });
+      return;
+    }
     this.endIndex = (this.endIndex + 1) % combined.length;
     if (this.endIndex === this.startIndex) {
       this.startIndex = (this.startIndex + 1) % combined.length;
@@ -472,22 +447,91 @@ interface TtsModule {
   }
 
   private getPoiCandidates(): Array<MapLabel> {
-    if (this.labels.length) {
-      return this.labels;
+    const list: Array<MapLabel> = [];
+    // Prefer real places (admin-added system places + user places) over OSM labels.
+    for (const place of this.places) {
+      // Keep route endpoints reasonable; allow hazards too if user really wants.
+      if (place.hidden) {
+        continue;
+      }
+      if (place.status !== 'approved' && place.status !== 'published') {
+        continue;
+      }
+      list.push({
+        name: place.name,
+        lat: place.lat,
+        lon: place.lon,
+        priority: Math.max(0, place.likes || 0),
+        kind: place.sourceType === 'system' ? 'system' : 'place'
+      });
     }
-    return this.poiFallback;
+    // Always keep a safe fallback so modulo math never breaks.
+    if (list.length === 0) {
+      const center = this.getCampusBoundsCenter();
+      list.push({ name: '校园中心', lat: center.lat, lon: center.lon, priority: 0, kind: 'fallback' });
+    }
+    return list;
   }
 
   private sendMyLocation(lat: number, lon: number): void {
     const loc: LatLon = { lat, lon };
     this.myLocation = loc;
     this.myLocationUpdatedAt = Date.now();
-    const source = this.mockLocationEnabled ? '模拟定位' : '真实定位';
-    this.myLocationStatusText = `${source} 已更新: ${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+    const inCampus = this.isInCampusBounds(lat, lon);
+    this.isOffCampus = !inCampus;
+    this.myLocationStatusText = `定位已更新: ${lat.toFixed(6)}, ${lon.toFixed(6)}` + (inCampus ? '' : '（不在学校范围内）');
+    if (!inCampus) {
+      const now = Date.now();
+      if (now - this.offCampusToastAt > 15000) {
+        this.offCampusToastAt = now;
+        promptAction.showToast({ message: '您当前不在学校范围内，已为您保持显示校园地图', duration: 1800 });
+      }
+    }
     this.checkHazardProximity(loc);
     this.checkRouteHazardAhead(loc);
     this.lastLocation = loc;
+
+    // Default route start to current location, and keep it synced while start is "我的位置".
+    if (!this.routeStart || this.routeStartLabel === '我的位置') {
+      this.routeStart = loc;
+      this.routeStartLabel = '我的位置';
+    }
+
     this.maybeReplanRouteWithMyLocation(loc);
+    this.maybeAutoFollowMyLocation();
+  }
+
+  handleExternalTransform(zoom: number, offsetX: number, offsetY: number): void {
+    this.zoom = zoom;
+    this.offsetX = offsetX;
+    this.offsetY = offsetY;
+    const now = Date.now();
+    if (now - this.lastProgramCenterAt > 250) {
+      this.lastUserTransformAt = now;
+    }
+  }
+
+  private maybeAutoFollowMyLocation(): void {
+    if (!this.myLocation) {
+      return;
+    }
+    if (this.currentPage !== PageView.Map) {
+      return;
+    }
+    // Keep showing campus even when GPS is off-campus.
+    if (this.isOffCampus) {
+      return;
+    }
+    if (!this.hasCenteredOnMyLocation) {
+      this.hasCenteredOnMyLocation = true;
+      this.centerMapOnMyLocation();
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastUserTransformAt < 3000) {
+      return;
+    }
+    this.centerMapOnMyLocation();
   }
 
   private maybeReplanRouteWithMyLocation(loc: LatLon): void {
@@ -525,50 +569,9 @@ interface TtsModule {
     return center;
   }
 
-  private generateMockLocation(): LatLon {
-    if (!this.mockSimCenter) {
-      this.mockSimCenter = this.getCampusCenter();
-      this.mockSimStartAt = Date.now();
-    }
-    const center = this.mockSimCenter;
-    const radius = this.mockSimRadiusM;
-    const speed = this.mockSimSpeedMps;
-    const circumference = 2 * Math.PI * Math.max(1, radius);
-    const periodMs = (circumference / Math.max(0.1, speed)) * 1000;
-    const phase = ((Date.now() - this.mockSimStartAt) % periodMs) / periodMs;
-    const theta = phase * 2 * Math.PI;
-
-    const dNorth = Math.cos(theta) * radius;
-    const dEast = Math.sin(theta) * radius;
-    const metersPerDegLat = 111320;
-    const metersPerDegLon = metersPerDegLat * Math.cos(center.lat * Math.PI / 180);
-    const deltaLat = dNorth / metersPerDegLat;
-    const deltaLon = dEast / metersPerDegLon;
-    return { lat: center.lat + deltaLat, lon: center.lon + deltaLon };
-  }
-
-  private hasLocationPermission(): boolean {
-    try {
-      const context = this.getHostContext() as unknown as UIAbilityContextLike;
-      const tokenId = context && context.applicationInfo ? context.applicationInfo.accessTokenId : undefined;
-      if (typeof tokenId !== 'number') {
-        return false;
-      }
-      const atManager = abilityAccessCtrl.createAtManager();
-      const checker = (atManager as AtManagerLike).checkAccessToken;
-      if (typeof checker !== 'function') {
-        return false;
-      }
-      const status = checker(tokenId, 'ohos.permission.LOCATION');
-      return status === abilityAccessCtrl.GrantStatus.PERMISSION_GRANTED;
-    } catch (e) {
-      return false;
-    }
-  }
-
   private async ensureLocationPermission(): Promise<boolean> {
     try {
-      if (this.hasLocationPermission()) {
+      if (this.locationPermissionGranted) {
         return true;
       }
       // Avoid repeatedly popping permission dialogs during polling.
@@ -580,10 +583,14 @@ interface TtsModule {
       const context = this.getHostContext();
       const atManager = abilityAccessCtrl.createAtManager();
       // Request minimal permission to avoid SDK-compat issues across versions.
-      const permissions: Array<string> = ['ohos.permission.LOCATION'];
-      const rawResult = await (atManager as AtManagerLike).requestPermissionsFromUser(context, permissions);
+      type OhosPermission = 'ohos.permission.LOCATION' | 'ohos.permission.APPROXIMATELY_LOCATION';
+      const permissions: Array<OhosPermission> = ['ohos.permission.LOCATION', 'ohos.permission.APPROXIMATELY_LOCATION'];
+      const rawResult = await atManager.requestPermissionsFromUser(context, permissions);
       const result: PermissionRequestResult | null = rawResult as PermissionRequestResult | null;
-      const authResults: Array<number> = result && result.authResults ? result.authResults : [];
+      let authResults: Array<number> = [];
+      if (result && result.authResults) {
+        authResults = result.authResults;
+      }
       if (authResults.length === 0) {
         return false;
       }
@@ -592,6 +599,7 @@ interface TtsModule {
           return false;
         }
       }
+      this.locationPermissionGranted = true;
       return true;
     } catch (error) {
       console.error(`请求定位权限失败: ${String(error)}`);
@@ -601,32 +609,21 @@ interface TtsModule {
 
   private async getRealLocation(): Promise<geoLocationManager.Location | null> {
     try {
-      const highPriority: geoLocationManager.LocationRequestPriority = 0 as geoLocationManager.LocationRequestPriority;
       const request: geoLocationManager.CurrentLocationRequest = {
-        priority: highPriority,
         scenario: geoLocationManager.LocationRequestScenario.NAVIGATION,
-        timeoutMs: 10000,
-        maxAccuracy: 0
-      };
+        timeoutMs: 12000
+      } as geoLocationManager.CurrentLocationRequest;
       const location = await geoLocationManager.getCurrentLocation(request);
       return location as geoLocationManager.Location;
     } catch (error) {
-      console.error(`获取真实定位失败: ${String(error)}`);
+      const detail = String(error);
+      console.error(`获取真实定位失败: ${detail}`);
+      this.myLocationStatusText = `获取真实定位失败: ${detail}`;
       return null;
     }
   }
 
   private async initMyLocation(): Promise<void> {
-    if (this.mockLocationEnabled) {
-      this.myLocationStatusText = '正在获取模拟定位...';
-      const mock = await this.getMockLocationOnce();
-      if (mock) {
-        this.sendMyLocation(mock.lat, mock.lon);
-      } else {
-        this.myLocationStatusText = '模拟定位获取失败（服务无响应或返回无效数据）';
-      }
-      return;
-    }
     this.myLocationStatusText = '正在获取真实定位...';
     const granted = await this.ensureLocationPermission();
     if (!granted) {
@@ -643,10 +640,8 @@ interface TtsModule {
   }
 
   /**
-   * Start periodic location updates. Uses mock generator in emulator mode,
-   * or polls `getCurrentLocation()` when running on a real device.
-   * This uses polling so it works even if the exact SDK location subscription API
-   * differs across platform versions.
+    * Start periodic location updates using system-provided location (device or simulator).
+    * Uses polling so it works even if the exact SDK location subscription API differs across versions.
    */
   private startLocationUpdates(intervalMs?: number): void {
     const ms = intervalMs && intervalMs > 0 ? intervalMs : this.locationUpdateIntervalMs;
@@ -661,26 +656,10 @@ interface TtsModule {
 
     this.activeLocationUpdateIntervalMs = ms;
 
-    if (this.mockLocationEnabled) {
-      const pollMock = async (): Promise<void> => {
-        try {
-          const mock = await this.getMockLocationOnce();
-          if (mock) {
-            this.sendMyLocation(mock.lat, mock.lon);
-          }
-        } catch (e) {
-          console.error('轮询模拟位置失败', e);
-        }
-      };
-      pollMock();
-      this.locationUpdateIntervalId = Number(setInterval(() => { void pollMock(); }, ms));
-      return;
-    }
-
     // Real device: poll getCurrentLocation with async wrapper
     const pollOnce = async (): Promise<void> => {
       try {
-        const granted = this.hasLocationPermission() ? true : await this.ensureLocationPermission();
+        const granted = this.locationPermissionGranted ? true : await this.ensureLocationPermission();
         if (!granted) {
           console.warn('定位权限未授予，停止定位更新');
           this.myLocationStatusText = '定位权限未授予，已停止自动定位更新';
@@ -691,7 +670,9 @@ interface TtsModule {
         if (real) {
           this.sendMyLocation(real.latitude, real.longitude);
         } else {
-          this.myLocationStatusText = '真实定位获取失败（轮询中）';
+          if (!this.myLocationStatusText) {
+            this.myLocationStatusText = '真实定位获取失败（轮询中）';
+          }
         }
       } catch (e) {
         console.error('轮询位置失败', e);
@@ -716,42 +697,79 @@ interface TtsModule {
     this.activeLocationUpdateIntervalMs = 0;
   }
 
-  private async getMockLocationOnce(): Promise<LatLon | null> {
-    const url = (this.mockLocationServerUrl || '').trim();
-    if (!url) {
-      return this.generateMockLocation();
-    }
-    try {
-      const req = netHttp.createHttp();
-      const options: netHttp.HttpRequestOptions = {
-        method: netHttp.RequestMethod.GET,
-        connectTimeout: 4000,
-        readTimeout: 4000
-      };
-      const resp = await req.request(url, options);
-      const raw = resp && resp.result ? String(resp.result) : '';
-      // Expect {lat, lon} or {latitude, longitude}
-      const parsed = raw ? (JSON.parse(raw) as Record<string, number>) : null;
-      const lat = parsed ? (Number(parsed.lat) || Number(parsed.latitude) || 0) : 0;
-      const lon = parsed ? (Number(parsed.lon) || Number(parsed.longitude) || 0) : 0;
-      if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) {
-        return null;
-      }
-      return { lat, lon };
-    } catch (e) {
-      // Fallback to local movement simulation if the external simulator is unreachable.
-      return this.generateMockLocation();
-    }
-  }
-
   private showHazardWarning(text: string): void {
+    this.hazardWarningToken += 1;
+    const token = this.hazardWarningToken;
     this.hazardWarningText = text;
     this.hazardWarningVisible = true;
     // Auto hide after 3 seconds
     setTimeout(() => {
+      // Only hide if no newer warning has been shown.
+      if (this.hazardWarningToken !== token) {
+        return;
+      }
       this.hazardWarningVisible = false;
       this.hazardWarningText = '';
     }, 3000);
+  }
+
+  private bearingDegrees(from: LatLon, to: LatLon): number {
+    // Bearing: 0° = North, 90° = East
+    const lat1 = from.lat * Math.PI / 180;
+    const lat2 = to.lat * Math.PI / 180;
+    const dLon = (to.lon - from.lon) * Math.PI / 180;
+    const y = Math.sin(dLon) * Math.cos(lat2);
+    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+    let brng = Math.atan2(y, x) * 180 / Math.PI;
+    if (brng < 0) {
+      brng += 360;
+    }
+    return brng;
+  }
+
+  private bearingArrow(degrees: number): string {
+    const dirs = ['↑', '↗', '→', '↘', '↓', '↙', '←', '↖'];
+    const idx = Math.round(degrees / 45) % 8;
+    return dirs[idx];
+  }
+
+  private bearingText(degrees: number): string {
+    const names = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'];
+    const idx = Math.round(degrees / 45) % 8;
+    return names[idx];
+  }
+
+  private showNearestWaterMineInfo(): void {
+    const current = this.myLocation;
+    if (!current) {
+      promptAction.showToast({ message: '请先开启定位，再进行水雷排查', duration: 1600 });
+      return;
+    }
+    const allPlaces = this.placeService.getCachedPlaces();
+    let bestDist = Number.POSITIVE_INFINITY;
+    let bestPlace: Place | null = null;
+    for (const place of allPlaces) {
+      if (place.type !== 'water') {
+        continue;
+      }
+      const dist = this.distanceMeters(current, { lat: place.lat, lon: place.lon });
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPlace = place;
+      }
+    }
+    if (!bestPlace || !isFinite(bestDist)) {
+      const msg = '当前没有水雷标记';
+      this.showHazardWarning(msg);
+      promptAction.showToast({ message: msg, duration: 1600 });
+      return;
+    }
+    const bearing = this.bearingDegrees(current, { lat: bestPlace.lat, lon: bestPlace.lon });
+    const arrow = this.bearingArrow(bearing);
+    const dirText = this.bearingText(bearing);
+    const msg = `最近水雷：${bestDist.toFixed(1)}m 方向：${arrow}（${dirText}）`;
+    this.showHazardWarning(msg);
+    promptAction.showToast({ message: msg, duration: 2200 });
   }
 
   private checkRouteHazardAhead(current: LatLon): void {
@@ -821,28 +839,11 @@ interface TtsModule {
   private async tryVibrateAndSpeak(text: string): Promise<void> {
     // Vibration / TTS are device-dependent; keep best-effort and never crash.
     try {
-      const vib = vibrator as VibratorModule;
-      if (vib.vibrate) {
-        vib.vibrate(250);
-      }
+      vibrator.vibrate(250);
     } catch (e) {
       // ignore
     }
-    try {
-      if (!this.ttsEngine) {
-        const tts = textToSpeech as TtsModule;
-        if (tts.createTextToSpeechEngine) {
-          this.ttsEngine = tts.createTextToSpeechEngine();
-        }
-      }
-      if (this.ttsEngine && this.ttsEngine.speakText) {
-        this.ttsEngine.speakText(text);
-      } else {
-        console.info('TTS fallback:', text);
-      }
-    } catch (e) {
-      // ignore
-    }
+    console.info('Hazard alert:', text);
   }
 
   private invalidateRoute(): void {
@@ -986,10 +987,47 @@ interface TtsModule {
     return offsets;
   }
 
+  private getCampusBoundsCenter(): LatLon {
+    const b = this.renderData.bounds;
+    const center: LatLon = { lat: (b.minLat + b.maxLat) / 2, lon: (b.minLon + b.maxLon) / 2 };
+    return center;
+  }
+
+  private isInCampusBounds(lat: number, lon: number): boolean {
+    const b = this.renderData.bounds;
+    // Add a small margin so boundary jitter won't constantly flip state.
+    const marginLat = 0.0015;
+    const marginLon = 0.0015;
+    if (lat < b.minLat - marginLat || lat > b.maxLat + marginLat) {
+      return false;
+    }
+    if (lon < b.minLon - marginLon || lon > b.maxLon + marginLon) {
+      return false;
+    }
+    return true;
+  }
+
+  private centerMapOnCampus(): void {
+    this.lastProgramCenterAt = Date.now();
+    const center = this.getCampusBoundsCenter();
+    const nextZoom = clampZoom(1.8);
+    const offsets = this.computeCenterOffsets(center.lat, center.lon, nextZoom);
+    this.zoom = nextZoom;
+    this.offsetX = offsets.offsetX;
+    this.offsetY = offsets.offsetY;
+    this.currentPage = PageView.Map;
+  }
+
   private centerMapOnMyLocation(): void {
     if (!this.myLocation) {
+      this.centerMapOnCampus();
       return;
     }
+    if (!this.isInCampusBounds(this.myLocation.lat, this.myLocation.lon)) {
+      this.centerMapOnCampus();
+      return;
+    }
+    this.lastProgramCenterAt = Date.now();
     const nextZoom = clampZoom(this.zoom < 1.6 ? 1.8 : this.zoom);
     const offsets = this.computeCenterOffsets(this.myLocation.lat, this.myLocation.lon, nextZoom);
     this.zoom = nextZoom;
@@ -1082,10 +1120,32 @@ interface TtsModule {
   }
 
   private checkHazardProximity(current: LatLon): void {
+    // Always-on: if a watermine is within 3m, show a UI warning.
+    const now = Date.now();
+    if (now - this.lastWaterMineDangerAt >= 2000) {
+      let nearest = Number.POSITIVE_INFINITY;
+      const allPlaces = this.placeService.getCachedPlaces();
+      for (const place of allPlaces) {
+        if (place.type !== 'water') {
+          continue;
+        }
+        const dist = this.distanceMeters(current, { lat: place.lat, lon: place.lon });
+        if (dist < nearest) {
+          nearest = dist;
+        }
+      }
+      if (nearest < 3.0) {
+        this.lastWaterMineDangerAt = now;
+        const msg = `危险：3米内有水雷（约 ${nearest.toFixed(1)}m）`;
+        this.showHazardWarning(msg);
+        void this.tryVibrateAndSpeak(msg);
+      }
+    }
+
+    // Optional: directional 5m warning when hazard mode / avoidHazards is enabled.
     if (!this.hazardMode && !this.filter.avoidHazards) {
       return;
     }
-    const now = Date.now();
     if (now - this.lastHazardAlertAt < 5000) {
       return;
     }
@@ -1202,11 +1262,12 @@ interface TtsModule {
 
   private buildLocationOptions(): Array<LocationOption> {
     const list: Array<LocationOption> = [];
-    for (const label of this.getPoiCandidates()) {
-      list.push(new LocationOption(label.name, label.lat, label.lon, '系统地点', '', 'system', 0));
+    if (this.myLocation) {
+      list.push(new LocationOption('我的位置', this.myLocation.lat, this.myLocation.lon, '当前位置', '', 'gps', 0));
     }
     for (const place of this.places) {
-      list.push(new LocationOption(place.name, place.lat, place.lon, '自定义', place.id, place.status, place.likes));
+      const source = place.sourceType === 'system' ? '系统地点' : '自定义';
+      list.push(new LocationOption(place.name, place.lat, place.lon, source, place.id, place.status, place.likes));
     }
     return list;
   }
@@ -1297,9 +1358,6 @@ interface TtsModule {
       this.tapPlace = null;
       this.tapLocation = null;
       this.focusPlace = null;
-      if (this.labels && this.labels.length > 0) {
-        this.placeService.hardReseedSystemPlaces(this.labels);
-      }
 
       // Force a remote sync first so manual/auto refresh always pulls latest.
       // If remote fails, still fall back to cached/local but show the error.
@@ -1524,9 +1582,52 @@ interface TtsModule {
       this.bindEmail = '';
       this.bindCode = '';
     }
-    void this.loadMessagesForSession(session);
-    void this.loadMyPlaces();
-    this.refreshPlaces();
+    void this.onSessionChanged(session);
+  }
+
+  private getMessageReadAtStorageKey(username: string): string {
+    return 'lastMessageReadAt_' + username;
+  }
+
+  private async loadPersistedMessageReadAt(username: string): Promise<number> {
+    try {
+      const ctx = this.getHostContext();
+      const store = await preferences.getPreferences(ctx, 'nwpu-campus');
+      const key = this.getMessageReadAtStorageKey(username);
+      const raw = await store.get(key, 0);
+      const asNum = typeof raw === 'number'
+        ? raw
+        : (typeof raw === 'string' ? Number(raw) : 0);
+      if (typeof asNum === 'number' && Number.isFinite(asNum) && asNum > 0) {
+        return asNum;
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async persistMessageReadAt(username: string, ts: number): Promise<void> {
+    try {
+      const ctx = this.getHostContext();
+      const store = await preferences.getPreferences(ctx, 'nwpu-campus');
+      const key = this.getMessageReadAtStorageKey(username);
+      await store.put(key, ts);
+      await store.flush();
+    } catch {
+      // ignore
+    }
+  }
+
+  private async onSessionChanged(session: UserSession | null): Promise<void> {
+    if (session && !session.isAdmin) {
+      this.lastMessageReadAt = await this.loadPersistedMessageReadAt(session.username);
+    } else {
+      this.lastMessageReadAt = 0;
+    }
+    await this.loadMessagesForSession(session);
+    await this.loadMyPlaces();
+    void this.refreshPlaces();
   }
 
   private cyclePlaceType(): void {
@@ -1634,16 +1735,24 @@ interface TtsModule {
         return '';
       }
       const module = requireNapi('photoAccessHelper');
-      if (!module || !module.getPhotoAccessHelper) {
+      if (!module) {
         return '';
       }
-      const helper = module.getPhotoAccessHelper(context);
-      if (!helper || !helper.select) {
+      const getHelper = module.getPhotoAccessHelper;
+      if (!getHelper) {
+        return '';
+      }
+      const helper = getHelper(context);
+      if (!helper) {
+        return '';
+      }
+      const selectFn = helper.select;
+      if (!selectFn) {
         return '';
       }
       const options: PhotoSelectOptions = { maxSelectNumber: 1 };
-      const result = await helper.select(options);
-      const uris: Array<string> = result && result.photoUris ? result.photoUris : [];
+      const result: PhotoSelectResult = await selectFn(options);
+      const uris: Array<string> = result.photoUris ? result.photoUris : [];
       const uri = uris.length > 0 ? uris[0] : '';
       return uri || '';
     } catch (error) {
@@ -1762,13 +1871,23 @@ interface TtsModule {
 
   private async handleApprove(placeId: string): Promise<void> {
     const session = this.authService.getSession();
-    await this.placeService.approve(placeId, session);
+    const ok = await this.placeService.approve(placeId, session);
+    if (!ok) {
+      const msg = this.placeService.getLastError() || '操作失败，请检查网络或权限';
+      promptAction.showToast({ message: msg, duration: 1700 });
+      return;
+    }
     await this.refreshPlaces();
   }
 
   private async handleReject(placeId: string): Promise<void> {
     const session = this.authService.getSession();
-    await this.placeService.reject(placeId, session);
+    const ok = await this.placeService.reject(placeId, session);
+    if (!ok) {
+      const msg = this.placeService.getLastError() || '操作失败，请检查网络或权限';
+      promptAction.showToast({ message: msg, duration: 1700 });
+      return;
+    }
     await this.refreshPlaces();
   }
 
@@ -1886,6 +2005,24 @@ interface TtsModule {
     return this.authService.getSession();
   }
 
+  private getSessionUsername(): string {
+    const session = this.getSession();
+    return session ? session.username : '';
+  }
+
+  private getSessionEmail(): string {
+    const session = this.getSession();
+    return session && session.email ? session.email : '';
+  }
+
+  private getSelectedPointText(): string {
+    const point = this.getSelectedPoint();
+    if (!point) {
+      return '未选择位置';
+    }
+    return '位置: ' + String(point.lat.toFixed(5)) + ', ' + String(point.lon.toFixed(5));
+  }
+
   private async loadMessagesForSession(session: UserSession | null): Promise<void> {
     if (!session) {
       this.messages = [];
@@ -1895,14 +2032,30 @@ interface TtsModule {
     }
     const list = await this.messageService.list(session);
     const normalized: Array<UserMessage> = [];
-    const readAt = this.lastMessageReadAt;
+    const localReadAt = this.lastMessageReadAt;
+    let maxReadAt = localReadAt;
     list.forEach((msg) => {
       const raw = msg as RawUserMessage;
       const createdAt = typeof msg.createdAt === 'number'
         ? msg.createdAt
         : (typeof raw.date === 'number' ? raw.date : Date.now());
-      const baseUnread = msg.unread === undefined ? true : msg.unread;
-      const unread = baseUnread && createdAt > readAt;
+
+      // Prefer server persistence fields when present.
+      const serverRead = typeof raw.read === 'boolean'
+        ? raw.read
+        : (typeof msg.read === 'boolean' ? msg.read : undefined);
+      const serverReadAt = typeof raw.readAt === 'number'
+        ? raw.readAt
+        : (typeof msg.readAt === 'number' ? msg.readAt : 0);
+      if (typeof serverReadAt === 'number' && Number.isFinite(serverReadAt) && serverReadAt > maxReadAt) {
+        maxReadAt = serverReadAt;
+      }
+
+      const baseUnread = typeof serverRead === 'boolean'
+        ? (!serverRead)
+        : (msg.unread === undefined ? true : msg.unread);
+      const effectiveReadAt = Math.max(localReadAt, (typeof serverReadAt === 'number' ? serverReadAt : 0));
+      const unread = baseUnread && createdAt > effectiveReadAt;
       const type = raw.type || '';
       const title = msg.title || (type === 'feedback'
         ? '地点反馈'
@@ -1940,6 +2093,12 @@ interface TtsModule {
     }
     this.messages = limited;
     this.unreadCount = session.isAdmin ? 0 : normalized.filter((msg) => msg.unread).length;
+
+    // If server reports a newer readAt than local cache, persist it locally too.
+    if (!session.isAdmin && maxReadAt > this.lastMessageReadAt) {
+      this.lastMessageReadAt = maxReadAt;
+      await this.persistMessageReadAt(session.username, this.lastMessageReadAt);
+    }
   }
 
   private async pushMessage(username: string, message: UserMessage): Promise<void> {
@@ -1963,6 +2122,7 @@ interface TtsModule {
     }
     await this.messageService.markAllRead(session);
     this.lastMessageReadAt = Date.now();
+    await this.persistMessageReadAt(session.username, this.lastMessageReadAt);
     const list: Array<UserMessage> = [];
     this.messages.forEach((msg) => {
       msg.unread = false;
@@ -1980,6 +2140,10 @@ interface TtsModule {
     const session = this.getSession();
     if (session) {
       await this.loadMessagesForSession(session);
+      // Opening the panel is treated as "read".
+      if (!session.isAdmin && this.unreadCount > 0) {
+        await this.markAllMessagesRead();
+      }
     }
   }
 
@@ -2590,7 +2754,7 @@ interface TtsModule {
         route: this.routeVisible ? this.route : null,
         markers: this.buildRouteMarkers(),
         places: this.places,
-        currentUser: this.getSession() ? this.getSession()!.username : '',
+        currentUser: this.getSessionUsername(),
         filter: this.filter,
         myLocation: this.myLocation,
         zoom: this.zoom,
@@ -2604,6 +2768,17 @@ interface TtsModule {
         Column() {
           if (this.showUi) {
             Column({ space: 10 }) {
+              if (this.isOffCampus) {
+                Row() {
+                  Text('📍 您当前不在学校范围内')
+                    .fontSize(12)
+                    .fontColor('#ffffff');
+                }
+                .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+                .backgroundColor('#f59e0b')
+                .borderRadius(10)
+                .width('100%');
+              }
               if (this.hazardWarningVisible && this.hazardWarningText) {
                 Row() {
                   Text('⚠ ' + this.hazardWarningText)
@@ -2645,13 +2820,7 @@ interface TtsModule {
                     .backgroundColor(this.colorPrimary)
                     .fontColor('#ffffff')
                     .onClick(() => {
-                      if (this.myLocation) {
-                        const nextZoom = clampZoom(2.2);
-                        const offsets = this.computeCenterOffsets(this.myLocation.lat, this.myLocation.lon, nextZoom);
-                        this.zoom = nextZoom;
-                        this.offsetX = offsets.offsetX;
-                        this.offsetY = offsets.offsetY;
-                      }
+                      this.centerMapOnMyLocation();
                     });
                   if (this.dynamicNavActive) {
                     Button('停止')
@@ -2671,7 +2840,7 @@ interface TtsModule {
                     .fontColor('#ffffff');
                   Button('规划路线')
                     .fontSize(12)
-                    .width(64)
+                    .width(88)
                     .height(32)
                     .backgroundColor(this.colorPrimary)
                     .fontColor('#ffffff')
@@ -2760,20 +2929,30 @@ interface TtsModule {
                     Column({ space: 8 }) {
                       if (this.getSession()) {
                         Row({ space: 8 }) {
-                          Button(this.voteButtonLabel(this.tapPlace!.id, 1))
+                              Button(this.voteButtonLabel(this.tapPlace.id, 1))
                             .layoutWeight(1)
                             .height(34)
                             .fontSize(12)
                             .backgroundColor(this.colorPrimary)
                             .fontColor('#ffffff')
-                            .onClick(() => { void this.handleVote(this.tapPlace!.id, 1); });
-                          Button(this.voteButtonLabel(this.tapPlace!.id, -1))
+                                .onClick(() => {
+                                  const place = this.tapPlace;
+                                  if (place) {
+                                    void this.handleVote(place.id, 1);
+                                  }
+                                });
+                              Button(this.voteButtonLabel(this.tapPlace.id, -1))
                             .layoutWeight(1)
                             .height(34)
                             .fontSize(12)
                             .backgroundColor(this.colorPrimaryLight)
                             .fontColor(this.colorPrimary)
-                            .onClick(() => { void this.handleVote(this.tapPlace!.id, -1); });
+                                .onClick(() => {
+                                  const place = this.tapPlace;
+                                  if (place) {
+                                    void this.handleVote(place.id, -1);
+                                  }
+                                });
                         }
                         .width('100%');
                       } else {
@@ -2789,14 +2968,24 @@ interface TtsModule {
                           .fontSize(12)
                           .backgroundColor(this.colorPrimaryLight)
                           .fontColor(this.colorPrimary)
-                          .onClick(() => { void this.handleToggleFavorite(this.tapPlace!.id, !this.isPlaceFavorite(this.tapPlace!.id)); });
+                          .onClick(() => {
+                            const place = this.tapPlace;
+                            if (place) {
+                              void this.handleToggleFavorite(place.id, !this.isPlaceFavorite(place.id));
+                            }
+                          });
                         Button(this.isPlaceHidden(this.tapPlace.id) ? '显示' : '隐藏')
                           .layoutWeight(1)
                           .height(34)
                           .fontSize(12)
                           .backgroundColor(this.colorPrimaryLight)
                           .fontColor(this.colorPrimary)
-                          .onClick(() => { void this.handleToggleHidden(this.tapPlace!.id, !this.isPlaceHidden(this.tapPlace!.id)); });
+                          .onClick(() => {
+                            const place = this.tapPlace;
+                            if (place) {
+                              void this.handleToggleHidden(place.id, !this.isPlaceHidden(place.id));
+                            }
+                          });
                       }
                       .width('100%');
 
@@ -2808,7 +2997,12 @@ interface TtsModule {
                             .fontSize(12)
                             .backgroundColor('#f0f2f7')
                             .fontColor('#1d2a42')
-                            .onClick(() => { this.openEditPlace(this.tapPlace!, false); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                this.openEditPlace(place, false);
+                              }
+                            });
                           if (this.tapPlace.status === 'draft' || this.tapPlace.status === 'private' || this.tapPlace.status === 'rejected') {
                             Button(this.isAdmin() ? '确认修改并应用' : '提交审核')
                               .layoutWeight(1)
@@ -2816,7 +3010,12 @@ interface TtsModule {
                               .fontSize(12)
                               .backgroundColor(this.colorPrimary)
                               .fontColor('#ffffff')
-                              .onClick(() => { void this.handleApply(this.tapPlace!.id); });
+                              .onClick(() => {
+                                const place = this.tapPlace;
+                                if (place) {
+                                  void this.handleApply(place.id);
+                                }
+                              });
                           }
                           Button('删除')
                             .layoutWeight(1)
@@ -2824,7 +3023,12 @@ interface TtsModule {
                             .fontSize(12)
                             .backgroundColor('#ffecec')
                             .fontColor(this.colorDanger)
-                            .onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                this.handleDelete(place.id);
+                              }
+                            });
                         }
                         .width('100%');
                       } else {
@@ -2835,14 +3039,24 @@ interface TtsModule {
                             .fontSize(12)
                             .backgroundColor('#f0f2f7')
                             .fontColor('#1d2a42')
-                            .onClick(() => { this.openEditPlace(this.tapPlace!, true); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                this.openEditPlace(place, true);
+                              }
+                            });
                           Button('反馈')
                             .layoutWeight(1)
                             .height(34)
                             .fontSize(12)
                             .backgroundColor('#f0f2f7')
                             .fontColor('#1d2a42')
-                            .onClick(() => { void this.handleFeedback(this.tapPlace!.id); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                void this.handleFeedback(place.id);
+                              }
+                            });
                         }
                         .width('100%');
 
@@ -2854,7 +3068,12 @@ interface TtsModule {
                               .fontSize(12)
                               .backgroundColor('#ffecec')
                               .fontColor(this.colorDanger)
-                              .onClick(() => { this.handleDelete(this.tapPlace!.id); });
+                              .onClick(() => {
+                                const place = this.tapPlace;
+                                if (place) {
+                                  this.handleDelete(place.id);
+                                }
+                              });
                           }
                           .width('100%');
                         }
@@ -2868,14 +3087,24 @@ interface TtsModule {
                             .fontSize(12)
                             .backgroundColor('#e8f7f1')
                             .fontColor(this.colorAccent)
-                            .onClick(() => { void this.handleApprove(this.tapPlace!.id); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                void this.handleApprove(place.id);
+                              }
+                            });
                           Button('拒绝')
                             .layoutWeight(1)
                             .height(34)
                             .fontSize(12)
                             .backgroundColor('#ffecec')
                             .fontColor(this.colorDanger)
-                            .onClick(() => { void this.handleReject(this.tapPlace!.id); });
+                            .onClick(() => {
+                              const place = this.tapPlace;
+                              if (place) {
+                                void this.handleReject(place.id);
+                              }
+                            });
                         }
                         .width('100%');
                       }
@@ -2910,7 +3139,10 @@ interface TtsModule {
               Row() {
                 if (this.showUi) {
                   Button(this.hazardMode ? '退出水雷' : '水雷排查')
-                    .onClick(() => this.toggleHazardMode())
+                    .onClick(() => {
+                      this.showNearestWaterMineInfo();
+                      this.toggleHazardMode();
+                    })
                     .fontSize(12)
                     .width(96)
                     .height(38)
@@ -3085,7 +3317,8 @@ interface TtsModule {
 
   @Builder
   private buildProfilePage(): void {
-    Column() {
+    Scroll() {
+      Column() {
       Row() {
         Button('返回').onClick(() => { this.currentPage = PageView.Map; });
         Text('个人中心').fontSize(16).fontWeight(FontWeight.Bold).margin({ left: 12 });
@@ -3133,7 +3366,7 @@ interface TtsModule {
           .borderRadius(26);
 
           Column({ space: 4 }) {
-            Text(this.getSession() ? (this.getSession()!.username) : '游客模式')
+            Text(this.getSession() ? this.getSessionUsername() : '游客模式')
               .fontSize(14)
               .fontWeight(FontWeight.Bold)
               .fontColor('#1d2a42');
@@ -3169,8 +3402,8 @@ interface TtsModule {
               .fontWeight(FontWeight.Bold)
               .fontColor('#1d2a42');
             Blank().layoutWeight(1);
-            if (this.getSession()!.email) {
-              Text('已绑定: ' + this.getSession()!.email)
+            if (this.getSessionEmail()) {
+              Text('已绑定: ' + this.getSessionEmail())
                 .fontSize(11)
                 .fontColor('#7c8699');
             } else {
@@ -3248,32 +3481,13 @@ interface TtsModule {
       .shadow({ radius: 10, color: 'rgba(15, 25, 45, 0.06)', offsetX: 0, offsetY: 4 })
       .margin({ bottom: 12 });
 
-      // Location simulator controls (independent external program)
       Column({ space: 10 }) {
-        Text('定位测试（模拟运动）')
+        Text('定位状态')
           .fontSize(13)
           .fontWeight(FontWeight.Bold)
           .fontColor('#1d2a42');
-        Text('可配合电脑端 location-simulator 使用，返回 {lat, lon}。')
-          .fontSize(11)
-          .fontColor('#7c8699');
-        TextInput({ text: this.mockLocationServerUrl, placeholder: '模拟定位服务 URL，例如 http://电脑IP:9000/location' })
-          .backgroundColor('#f5f6fa')
-          .borderRadius(10)
-          .padding({ left: 10, right: 10 })
-          .onChange((value: string) => { this.mockLocationServerUrl = value; });
+
         Row({ space: 8 }) {
-          Button(this.mockLocationEnabled ? '✓ 已启用模拟定位' : '启用模拟定位')
-            .fontSize(11)
-            .backgroundColor(this.mockLocationEnabled ? this.colorPrimary : this.colorPrimaryLight)
-            .fontColor(this.mockLocationEnabled ? '#ffffff' : this.colorPrimary)
-            .layoutWeight(1)
-            .onClick(() => {
-              this.mockLocationEnabled = !this.mockLocationEnabled;
-              this.stopLocationUpdates();
-              void this.initMyLocation();
-              this.startLocationUpdates(this.dynamicNavActive ? 1000 : this.locationUpdateIntervalMs);
-            });
           Button('立即更新')
             .fontSize(11)
             .backgroundColor('#f0f2f7')
@@ -3385,10 +3599,14 @@ interface TtsModule {
             .fontSize(12)
             .backgroundColor(this.colorPrimary)
             .fontColor('#ffffff')
+            .height(36)
             .layoutWeight(1)
             .onClick(() => { this.currentPage = PageView.AdminPlaces; });
           Button('审核与反馈')
             .fontSize(12)
+            .backgroundColor(this.colorPrimary)
+            .fontColor('#ffffff')
+            .height(36)
             .layoutWeight(1)
             .onClick(() => { this.currentPage = PageView.AdminReview; });
         }
@@ -3409,16 +3627,11 @@ interface TtsModule {
           .layoutWeight(1)
           .onChange((value: string) => { this.profileAvatarUrl = value; });
       }
-      TextInput({ text: this.profileOldPassword, placeholder: '旧密码' })
-        .type(InputType.Password)
-        .onChange((value: string) => { this.profileOldPassword = value; });
-      TextInput({ text: this.profileNewPassword, placeholder: '新密码' })
-        .type(InputType.Password)
-        .onChange((value: string) => { this.profileNewPassword = value; });
       Button('保存资料')
         .onClick(() => { console.info('Profile saved locally'); })
         .margin({ bottom: 16 });
 
+      }
     }
     .padding(12)
     .width('100%')
@@ -3672,51 +3885,76 @@ interface TtsModule {
       }.margin({ bottom: 12 });
 
       if (this.detailPlace) {
-        if (this.detailPlace!.imageUrl) {
-          Image(this.detailPlace!.imageUrl)
+        if (this.detailPlace.imageUrl) {
+          Image(this.detailPlace.imageUrl)
             .width('100%')
             .height(160)
             .borderRadius(12)
             .margin({ bottom: 8 });
         }
-        Text(this.detailPlace!.name)
+        Text(this.detailPlace.name)
           .fontSize(15)
           .fontWeight(FontWeight.Bold)
           .margin({ bottom: 6 });
-        Text(this.detailPlace!.description || '暂无描述')
+        Text(this.detailPlace.description || '暂无描述')
           .fontSize(12)
           .fontColor('#7c8699')
           .margin({ bottom: 10 });
         Row({ space: 10 }) {
-          Button(this.voteButtonLabel(this.detailPlace!.id, 1))
+          Button(this.voteButtonLabel(this.detailPlace.id, 1))
             .fontSize(12)
             .backgroundColor('#ffffff')
             .fontColor('#1aa168')
-            .onClick(() => { void this.handleVote(this.detailPlace!.id, 1); });
-          Button(this.voteButtonLabel(this.detailPlace!.id, -1))
+            .onClick(() => {
+              const place = this.detailPlace;
+              if (place) {
+                void this.handleVote(place.id, 1);
+              }
+            });
+          Button(this.voteButtonLabel(this.detailPlace.id, -1))
             .fontSize(12)
             .backgroundColor('#ffffff')
             .fontColor('#d23f3f')
-            .onClick(() => { void this.handleVote(this.detailPlace!.id, -1); });
-          Button(this.isPlaceFavorite(this.detailPlace!.id) ? '取消收藏' : '收藏')
+            .onClick(() => {
+              const place = this.detailPlace;
+              if (place) {
+                void this.handleVote(place.id, -1);
+              }
+            });
+          Button(this.isPlaceFavorite(this.detailPlace.id) ? '取消收藏' : '收藏')
             .fontSize(12)
             .backgroundColor('#f0f2f7')
             .fontColor('#1d2a42')
-            .onClick(() => { void this.handleToggleFavorite(this.detailPlace!.id, !this.isPlaceFavorite(this.detailPlace!.id)); });
-          Button(this.isPlaceHidden(this.detailPlace!.id) ? '显示' : '隐藏')
+            .onClick(() => {
+              const place = this.detailPlace;
+              if (place) {
+                void this.handleToggleFavorite(place.id, !this.isPlaceFavorite(place.id));
+              }
+            });
+          Button(this.isPlaceHidden(this.detailPlace.id) ? '显示' : '隐藏')
             .fontSize(12)
             .backgroundColor('#f0f2f7')
             .fontColor('#1d2a42')
-            .onClick(() => { void this.handleToggleHidden(this.detailPlace!.id, !this.isPlaceHidden(this.detailPlace!.id)); });
+            .onClick(() => {
+              const place = this.detailPlace;
+              if (place) {
+                void this.handleToggleHidden(place.id, !this.isPlaceHidden(place.id));
+              }
+            });
           Button('查看位置')
             .fontSize(12)
             .backgroundColor('#f1edff')
             .fontColor(this.colorPrimary)
-            .onClick(() => { this.openPlaceOnMap(this.detailPlace!, PageView.PlaceDetail, 'detail'); });
+            .onClick(() => {
+              const place = this.detailPlace;
+              if (place) {
+                this.openPlaceOnMap(place, PageView.PlaceDetail, 'detail');
+              }
+            });
         }
         .margin({ bottom: 12 });
 
-        Text(`👍 ${this.detailPlace!.likes}  ·  👎 ${this.detailPlace!.dislikes}`)
+        Text(`👍 ${this.detailPlace.likes}  ·  👎 ${this.detailPlace.dislikes}`)
           .fontSize(12)
           .fontColor('#7c8699');
       } else {
@@ -3765,11 +4003,6 @@ interface TtsModule {
                 .fontWeight(FontWeight.Bold)
                 .fontColor('#1d2a42');
               Row({ space: 8 }) {
-                Button('上传全部地图节点')
-                  .fontSize(11)
-                  .backgroundColor(this.colorPrimary)
-                  .fontColor('#ffffff')
-                  .onClick(() => { void this.handleUploadAllSystemLabels(); });
                 Button('刷新')
                   .fontSize(11)
                   .backgroundColor('#f1edff')
@@ -4071,45 +4304,7 @@ interface TtsModule {
   }
 
   private async handleUploadAllSystemLabels(): Promise<void> {
-    const session = this.getSession();
-    if (!session || !session.isAdmin) {
-      promptAction.showToast({ message: '仅管理员可上传系统地点', duration: 1500 });
-      return;
-    }
-    if (!this.labels || this.labels.length === 0) {
-      promptAction.showToast({ message: '未加载地图节点', duration: 1500 });
-      return;
-    }
-    promptAction.showToast({ message: `开始上传：共 ${this.labels.length} 个节点`, duration: 1500 });
-    let okCount = 0;
-    let failCount = 0;
-    for (let i = 0; i < this.labels.length; i += 1) {
-      const label = this.labels[i];
-      if (!label || !label.name) {
-        continue;
-      }
-      const sourceKey = this.placeService.makeSystemSourceKey(label.name, label.lat, label.lon);
-      const input: SaveDraftInput = {
-        name: label.name,
-        description: '系统地点',
-        type: 'normal',
-        point: { lat: label.lat, lon: label.lon },
-        status: 'approved',
-        sourceType: 'system',
-        sourceKey
-      };
-      const saved = await this.placeService.saveDraft(input, session);
-      if (saved) {
-        okCount += 1;
-      } else {
-        failCount += 1;
-      }
-      if ((i + 1) % 50 === 0) {
-        promptAction.showToast({ message: `上传进度：${i + 1}/${this.labels.length}（成功 ${okCount}）`, duration: 1200 });
-      }
-    }
-    await this.refreshPlaces();
-    promptAction.showToast({ message: `上传完成：成功 ${okCount}，失败 ${failCount}`, duration: 2000 });
+    promptAction.showToast({ message: '已停用：不再支持从地图节点批量生成系统地点，请改为管理员手动添加', duration: 2200 });
   }
 
   private async handleMarkWaterMine(): Promise<void> {
@@ -4207,7 +4402,7 @@ interface TtsModule {
           .margin({ left: 12 });
       }.margin({ bottom: 12 });
 
-      Text(this.getSelectedPoint() ? ('位置: ' + String(this.getSelectedPoint()!.lat.toFixed(5)) + ', ' + String(this.getSelectedPoint()!.lon.toFixed(5))) : '未选择位置')
+      Text(this.getSelectedPointText())
         .fontSize(12)
         .fontColor('#7c8699');
       Button('重新选点')

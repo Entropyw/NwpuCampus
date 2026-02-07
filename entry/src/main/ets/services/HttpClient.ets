@@ -56,15 +56,47 @@ export class HttpClient {
       headers.Authorization = `Bearer ${token}`;
     }
 
+    const connectTimeoutMs = 8000;
+    const readTimeoutMs = 15000;
+    const hardTimeoutMs = connectTimeoutMs + readTimeoutMs + 2000;
+
     return new Promise<HttpResponse>((resolve, reject) => {
+      let settled = false;
+      const timerId = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        try {
+          request.destroy();
+        } catch {
+          // ignore
+        }
+        reject(new Error('Request timeout'));
+      }, hardTimeoutMs);
+
       request.request(url, {
         method,
         header: headers,
         expectDataType: http.HttpDataType.STRING,
         extraData: body ? JSON.stringify(body) : undefined,
-        connectTimeout: 6000,
-        readTimeout: 6000
+        connectTimeout: connectTimeoutMs,
+        readTimeout: readTimeoutMs
       }, (err: BusinessError | null, data: http.HttpResponse) => {
+        if (settled) {
+          try {
+            request.destroy();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        settled = true;
+        try {
+          clearTimeout(timerId);
+        } catch {
+          // ignore
+        }
         request.destroy();
         if (err) {
           reject(err);

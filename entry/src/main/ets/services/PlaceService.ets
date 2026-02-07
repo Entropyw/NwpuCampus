@@ -480,11 +480,18 @@ export class PlaceService {
     }
     if (this.useRemote && this.client && session.token) {
       try {
-  const payload: HttpRequestBody = new HttpRequestBody();
-  await this.client.request(http.RequestMethod.POST, `/api/admin/places/${placeId}/approve`, payload, session.token);
+        this.lastError = '';
+        const payload: HttpRequestBody = new HttpRequestBody();
+        const encodedId = encodeURIComponent(placeId);
+        const resp = await this.client.requestWithStatus(http.RequestMethod.POST, `/api/admin/places/${encodedId}/approve`, payload, session.token);
+        if (resp.status < 200 || resp.status >= 300) {
+          this.lastError = this.formatHttpError(resp.status, resp.body);
+          return false;
+        }
         place.status = 'approved';
         return true;
       } catch (e) {
+        this.lastError = `网络错误：${String(e)}`;
         return false;
       }
     }
@@ -501,11 +508,18 @@ export class PlaceService {
     }
     if (this.useRemote && this.client && session.token) {
       try {
-  const payload: HttpRequestBody = new HttpRequestBody();
-  await this.client.request(http.RequestMethod.POST, `/api/admin/places/${placeId}/reject`, payload, session.token);
+        this.lastError = '';
+        const payload: HttpRequestBody = new HttpRequestBody();
+        const encodedId = encodeURIComponent(placeId);
+        const resp = await this.client.requestWithStatus(http.RequestMethod.POST, `/api/admin/places/${encodedId}/reject`, payload, session.token);
+        if (resp.status < 200 || resp.status >= 300) {
+          this.lastError = this.formatHttpError(resp.status, resp.body);
+          return false;
+        }
         place.status = 'rejected';
         return true;
       } catch (e) {
+        this.lastError = `网络错误：${String(e)}`;
         return false;
       }
     }
@@ -803,8 +817,13 @@ export class PlaceService {
     }
     if (this.useRemote && this.client && session.token) {
       try {
-        const responseText = await this.client.request(http.RequestMethod.GET, '/api/places?scope=pending', undefined, session.token);
-        const response = this.parsePlacesResponse(responseText);
+        this.lastError = '';
+        const resp = await this.client.requestWithStatus(http.RequestMethod.GET, '/api/places?scope=pending', undefined, session.token);
+        if (resp.status < 200 || resp.status >= 300) {
+          this.lastError = this.formatHttpError(resp.status, resp.body);
+          return [];
+        }
+        const response = this.parsePlacesResponse(resp.body);
         const pending = response ? this.mapServerPlaces(response.pending) : [];
         if (pending.length > 0) {
           pending.forEach((place) => this.mergePlace(place));
@@ -812,6 +831,7 @@ export class PlaceService {
         }
       } catch (e) {
         // fallback to local
+        this.lastError = `网络错误：${String(e)}`;
       }
     }
     return this.places.filter((item) => item.status === 'pending');

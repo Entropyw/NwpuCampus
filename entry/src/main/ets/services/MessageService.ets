@@ -21,6 +21,9 @@ export interface UserMessage {
   content: string;
   createdAt: number;
   unread: boolean;
+  // Server fields (for persistence). Some backends return read/readAt instead of unread.
+  read?: boolean;
+  readAt?: number | null;
   action?: 'resubmit';
   place?: MessagePlaceSnapshot;
 }
